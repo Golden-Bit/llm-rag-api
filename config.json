@@ -1,5 +1,5 @@
 {
-  "nlp_core_service": "https://teatek-llm.theia-innovation.com/llm-core",
+  "nlp_core_service": "http://127.0.0.1:8100",
   "openai_api_keys": [
     "..."
   ]

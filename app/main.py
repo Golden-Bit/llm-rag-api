@@ -164,14 +164,43 @@ async def upload_file_to_contexts(file: UploadFile,
             loader_config_id = f"{context}_{file.filename.replace(' ', '_')}_loader"
             doc_store_collection_name = f"{context}_{file.filename.replace(' ', '_')}_collection"
 
+            file_type = file.filename.split(".")[-1].lower()
+
+            loaders = {
+                "pdf": "PyMuPDFLoader",
+                "txt": "TextLoader",
+                "png": "ImageDescriptionLoader",
+                "jpg": "ImageDescriptionLoader",
+            }
+
+            kwargs = {
+                "pdf": {
+            "pages": None,
+            "page_chunks": True,
+            "write_images": False,
+            "image_size_limit": 0.025,
+            #"embed_images": True,
+            #"image_path": "C:\\Users\\Golden Bit\\Desktop\\projects_in_progress\\GoldenProjects\\golden_bit\\repositories\\nlp-core-api\\tmp",
+        },
+                "png":{
+                    "openai_api_key": get_random_openai_api_key(),
+                    "resize_to": (256, 256)
+                },
+                "jpg": {
+                    "openai_api_key": get_random_openai_api_key(),
+                    "resize_to": (256, 256)
+                },
+                "txt": {}
+            }
+
             loader_config_data = {
                 "config_id": loader_config_id,
                 "path": f"data_stores/data/{context}",
                 "loader_map": {
-                  f"{file.filename.replace(' ', '_')}": "PyMuPDFLoader"
+                  f"{file.filename.replace(' ', '_')}": loaders[file_type]
                 },
                 "loader_kwargs_map": {
-                  f"{file.filename.replace(' ', '_')}": {"extract_images": True}
+                  f"{file.filename.replace(' ', '_')}": kwargs[file_type]
                 },
                 "metadata_map": {
                   f"{file.filename.replace(' ', '_')}": {
@@ -264,7 +293,7 @@ async def upload_file_to_contexts(file: UploadFile,
                     params={"document_collection": doc_store_collection_name}, timeout=timeout_settings)
                 if add_docs_response.status_code != 200:
                     print(add_docs_response.content)
-                    if cnt > 50:
+                    if cnt > 5:
                         raise HTTPException(status_code=add_docs_response.status_code, detail=add_docs_response.json())
                 else:
                     break
@@ -476,7 +505,7 @@ async def configure_and_load_chain_(
 
 # Modello di input per la configurazione e il caricamento della chain
 class ConfigureAndLoadChainInput(BaseModel):
-    contexts: List[str] = []  # Lista di contesti (vuota di default)
+    contexts: List[str] = [],  # Lista di contesti (vuota di default)
     model_name: Optional[str] = "gpt-4o"  # Nome del modello, default "gpt-4o-mini"
 
 @app.post("/configure_and_load_chain/")
