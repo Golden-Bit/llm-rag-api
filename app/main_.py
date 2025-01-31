@@ -1,3 +1,4 @@
+
 from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form, Query, Body
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
@@ -21,6 +22,7 @@ app.add_middleware(
     allow_methods=["*"],  # Permetti tutti i metodi (GET, POST, OPTIONS, ecc.)
     allow_headers=["*"],  # Permetti tutti gli headers
 )
+
 
 # Carica la configurazione dal file config.json
 with open("config.json") as config_file:
@@ -60,14 +62,12 @@ async def create_context_on_server(context_path: str, metadata: Optional[Dict[st
             raise HTTPException(status_code=response.status_code, detail=response.json())
         return response.json()
 
-
 async def delete_context_on_server(context_path: str):
     async with httpx.AsyncClient() as client:
         response = await client.delete(f"{NLP_CORE_SERVICE}/data_stores/delete_directory/{context_path}")
         if response.status_code != 200:
             raise HTTPException(status_code=response.status_code, detail=response.json())
         return response.json()
-
 
 async def list_contexts_from_server():
     async with httpx.AsyncClient() as client:
@@ -78,7 +78,7 @@ async def list_contexts_from_server():
 
 
 async def upload_file_to_contexts_(file: UploadFile, contexts: List[str],
-                                   file_metadata: Optional[Dict[str, Any]] = None):
+                                  file_metadata: Optional[Dict[str, Any]] = None):
     file_uuid = str(uuid.uuid4())  # Generate a UUID for the file
     file_content = await file.read()  # Read the file content once and reuse it
 
@@ -123,6 +123,7 @@ async def upload_file_to_contexts_(file: UploadFile, contexts: List[str],
 async def upload_file_to_contexts(file: UploadFile,
                                   contexts: List[str],
                                   file_metadata: Optional[Dict[str, Any]] = None):
+
     file_uuid = str(uuid.uuid4())  # Generate a UUID for the file
     file_content = await file.read()  # Read the file content once and reuse it
 
@@ -140,8 +141,7 @@ async def upload_file_to_contexts(file: UploadFile,
             files = {"file": (file.filename.replace(" ", "_"), file_content, file.content_type)}
 
             # Make the POST request to upload the file to the current context
-            response = await client.post(f"{NLP_CORE_SERVICE}/data_stores/upload", data=data, files=files,
-                                         timeout=timeout_settings)
+            response = await client.post(f"{NLP_CORE_SERVICE}/data_stores/upload", data=data, files=files, timeout=timeout_settings)
 
             if response.status_code != 200:
                 print(
@@ -175,14 +175,14 @@ async def upload_file_to_contexts(file: UploadFile,
 
             kwargs = {
                 "pdf": {
-                    "pages": None,
-                    "page_chunks": True,
-                    "write_images": False,
-                    "image_size_limit": 0.025,
-                    # "embed_images": True,
-                    # "image_path": "C:\\Users\\Golden Bit\\Desktop\\projects_in_progress\\GoldenProjects\\golden_bit\\repositories\\nlp-core-api\\tmp",
-                },
-                "png": {
+            "pages": None,
+            "page_chunks": True,
+            "write_images": False,
+            "image_size_limit": 0.025,
+            #"embed_images": True,
+            #"image_path": "C:\\Users\\Golden Bit\\Desktop\\projects_in_progress\\GoldenProjects\\golden_bit\\repositories\\nlp-core-api\\tmp",
+        },
+                "png":{
                     "openai_api_key": get_random_openai_api_key(),
                     "resize_to": (256, 256)
                 },
@@ -197,18 +197,18 @@ async def upload_file_to_contexts(file: UploadFile,
                 "config_id": loader_config_id,
                 "path": f"data_stores/data/{context}",
                 "loader_map": {
-                    f"{file.filename.replace(' ', '_')}": loaders[file_type]
+                  f"{file.filename.replace(' ', '_')}": loaders[file_type]
                 },
                 "loader_kwargs_map": {
-                    f"{file.filename.replace(' ', '_')}": kwargs[file_type]
+                  f"{file.filename.replace(' ', '_')}": kwargs[file_type]
                 },
                 "metadata_map": {
-                    f"{file.filename.replace(' ', '_')}": {
-                        "source_context": f"{context}"
-                    }
+                  f"{file.filename.replace(' ', '_')}": {
+                    "source_context": f"{context}"
+                  }
                 },
                 "default_metadata": {
-                    "source_context": f"{context}"
+                   "source_context": f"{context}"
                 },
                 "recursive": True,
                 "max_depth": 5,
@@ -218,36 +218,35 @@ async def upload_file_to_contexts(file: UploadFile,
                 "use_multithreading": True,
                 "max_concurrency": 8,
                 "exclude": [
-                    "*.tmp",
-                    "*.log"
+                  "*.tmp",
+                  "*.log"
                 ],
                 "sample_size": 10,
                 "randomize_sample": True,
                 "sample_seed": 42,
                 "output_store_map": {
-                    f"{file.filename.replace(' ', '_')}": {
-                        "collection_name": doc_store_collection_name
-                    }
+                  f"{file.filename.replace(' ', '_')}": {
+                    "collection_name": doc_store_collection_name
+                  }
                 },
                 "default_output_store": {
-                    "collection_name": doc_store_collection_name
+                  "collection_name": doc_store_collection_name
                 }
-            }
+              }
 
             # Configure the loader on the original API
-            loader_response = await client.post(f"{NLP_CORE_SERVICE}/document_loaders/configure_loader",
-                                                json=loader_config_data)
+            loader_response = await client.post(f"{NLP_CORE_SERVICE}/document_loaders/configure_loader", json=loader_config_data)
             if loader_response.status_code != 200 and loader_response.status_code != 400:
+
                 raise HTTPException(status_code=loader_response.status_code, detail=loader_response.json())
 
             # Apply the loader to process the document
-            load_response = await client.post(f"{NLP_CORE_SERVICE}/document_loaders/load_documents/{loader_config_id}",
-                                              timeout=timeout_settings)
+            load_response = await client.post(f"{NLP_CORE_SERVICE}/document_loaders/load_documents/{loader_config_id}", timeout=timeout_settings)
             if load_response.status_code != 200:
                 raise HTTPException(status_code=load_response.status_code, detail=load_response.json())
 
             # Collect document processing results
-            # processed_docs = load_response.json()
+            #processed_docs = load_response.json()
 
             ### Configure the Vector Store ###
 
@@ -273,23 +272,19 @@ async def upload_file_to_contexts(file: UploadFile,
 
             # Configure the vector store
             vector_store_response = await client.post(
-                f"{NLP_CORE_SERVICE}/vector_stores/vector_store/configure", json=vector_store_config,
-                timeout=timeout_settings)
+                f"{NLP_CORE_SERVICE}/vector_stores/vector_store/configure", json=vector_store_config, timeout=timeout_settings)
             if vector_store_response.status_code != 200 and vector_store_response.status_code != 400:
                 raise HTTPException(status_code=vector_store_response.status_code, detail=vector_store_response.json())
 
-            # vector_store_config_id = vector_store_response.json()["config_id"]
+            #vector_store_config_id = vector_store_response.json()["config_id"]
 
             cnt = 0
             while True:
                 cnt += 1
                 ### Load the Vector Store ###
-                load_vector_response = await client.post(
-                    f"{NLP_CORE_SERVICE}/vector_stores/vector_store/load/{vector_store_config_id}",
-                    timeout=timeout_settings)
+                load_vector_response = await client.post(f"{NLP_CORE_SERVICE}/vector_stores/vector_store/load/{vector_store_config_id}", timeout=timeout_settings)
                 if load_vector_response.status_code != 200 and load_vector_response.status_code != 400:
-                    raise HTTPException(status_code=load_vector_response.status_code,
-                                        detail=load_vector_response.json())
+                    raise HTTPException(status_code=load_vector_response.status_code, detail=load_vector_response.json())
 
                 ### Add Documents from the Document Store to the Vector Store ###
                 # Use the document collection name associated with the context
@@ -306,36 +301,16 @@ async def upload_file_to_contexts(file: UploadFile,
         # Return the collected responses with file UUID and associated contexts
         return {"file_id": file_uuid, "contexts": contexts}
 
-
 ########################################################################################################################
 ########################################################################################################################
 
 
 # Create a new context (directory)
-class CreateContextRequest(BaseModel):
-    username: str
-    token: str
-    context_name: str
-    description: Optional[str] = None
-
-
 @app.post("/contexts", response_model=ContextMetadata)
-async def create_context(request: CreateContextRequest):
-    username = request.username
-    token = request.token
-
-    print(f"Creating context: {request.context_name} for user: {username}")
-
-    # Aggiungi username nei metadati del contesto
-    metadata = {
-        "description": request.description,
-        # "owner": username  # Memorizziamo l'username dell'utente che ha creato il contesto
-    }  # if request.description else {"owner": username}
-
-    result = await create_context_on_server(f"{username}-{request.context_name}", metadata)
-    print(result)
+async def create_context(context_name: str = Form(...), description: Optional[str] = Form(None)):
+    metadata = {"description": description} if description else None
+    result = await create_context_on_server(context_name, metadata)
     return result
-
 
 # Delete an existing context (directory)
 @app.delete("/contexts/{context_name}", response_model=Dict[str, Any])
@@ -344,42 +319,11 @@ async def delete_context(context_name: str):
     # TODO: delete related vector store (and all related collection in document store)
     return result
 
-
 # List all available contexts
-class ListContextsRequest(BaseModel):
-    username: str
-    token: str
-
-
-@app.post("/list_contexts", response_model=List[ContextMetadata])
-async def list_contexts(request: ListContextsRequest):
-    username = request.username
-    token = request.token
-
-    print(f"Listing contexts for user: {username}")
-
-    # Otteniamo tutti i contesti dal server
-    all_contexts = await list_contexts_from_server()
-
-    # Filtriamo i contesti per verificare che l'utente sia il proprietario
-    user_contexts = []
-    for context in all_contexts:
-        print(context)
-        path = context.get("path")  # Estrai l'username del proprietario
-        print(path)
-        if path:
-            if path.startswith(f"{username}-"):
-                context["path"] = context["path"].removeprefix(f"{username}-")
-                user_contexts.append(context)
-            else:
-                print(f"User {username} is not authorized to access")
-
-    # Se l'utente non ha accesso a nessun contesto, restituisci errore
-    if not user_contexts:
-        raise HTTPException(status_code=403, detail="Non sei autorizzato a visualizzare questi contesti.")
-
-    return user_contexts
-
+@app.get("/contexts", response_model=List[ContextMetadata])
+async def list_contexts():
+    result = await list_contexts_from_server()
+    return result
 
 # Upload a file to multiple contexts
 @app.post("/upload", response_model=FileUploadResponse)
@@ -469,7 +413,7 @@ async def delete_file(file_id: Optional[str] = Query(None), file_path: Optional[
     return result
 
 
-# @app.post("/configure_and_load_chain/")
+#@app.post("/configure_and_load_chain/")
 async def configure_and_load_chain_(
         context: str = Query("default", title="Context", description="The context for the chain configuration"),
         model_name: str = Query("gpt-4o-mini", title="Model Name",
@@ -561,13 +505,12 @@ async def configure_and_load_chain_(
 
 # Modello di input per la configurazione e il caricamento della chain
 class ConfigureAndLoadChainInput(BaseModel):
-    contexts: List[str] = []  # Lista di contesti (vuota di default)
+    contexts: List[str] = [],  # Lista di contesti (vuota di default)
     model_name: Optional[str] = "gpt-4o"  # Nome del modello, default "gpt-4o-mini"
-
 
 @app.post("/configure_and_load_chain/")
 async def configure_and_load_chain(
-        input_data: ConfigureAndLoadChainInput  # Usa il modello come input
+    input_data: ConfigureAndLoadChainInput  # Usa il modello come input
 ):
     """
     Configura e carica una chain in memoria basata sul contesto dato.
@@ -581,7 +524,7 @@ async def configure_and_load_chain(
 
     timeout_settings = httpx.Timeout(600.0, connect=600.0, read=600.0, write=600.0)
 
-    # vector_store_config_id = f"{context}_vector_store_config"
+    #vector_store_config_id = f"{context}_vector_store_config"
     vectorstore_ids = [f"{context}_vector_store" for context in contexts]
 
     # Impostazione di configurazione per l'LLM basata su model_name (di default "gpt-4o")
@@ -594,12 +537,11 @@ async def configure_and_load_chain(
         llm_response = await client.post(load_llm_url, timeout=timeout_settings)
 
         if llm_response.status_code != 200 and llm_response.status_code != 400:
-            raise HTTPException(status_code=llm_response.status_code,
-                                detail=f"Errore caricamento LLM: {llm_response.text}")
+            raise HTTPException(status_code=llm_response.status_code, detail=f"Errore caricamento LLM: {llm_response.text}")
 
         llm_load_result = llm_response.json()
 
-    # vectorstore_ids = [vector_store_id]
+    #vectorstore_ids = [vector_store_id]
 
     tools = [{"name": "VectorStoreTools", "kwargs": {"store_id": vectorstore_id}} for vectorstore_id in vectorstore_ids]
     tools.append({"name": "MongoDBTools",
@@ -615,9 +557,9 @@ async def configure_and_load_chain(
         "config_id": f"{id_}_agent_with_tools_config",
         "chain_id": f"{id_}_agent_with_tools",
         "system_message": """
-
+        
         WRITE HERE SYSTEM MESSAGE...
-
+        
         """,
         "llm_id": llm_id,  # Usa l'ID del modello LLM configurato
         "tools": tools
@@ -630,8 +572,7 @@ async def configure_and_load_chain(
             configure_response = await client.post(configure_url, json=chain_config)
 
             if configure_response.status_code != 200 and configure_response.status_code != 400:
-                raise HTTPException(status_code=configure_response.status_code,
-                                    detail=f"Errore configurazione: {configure_response.text}")
+                raise HTTPException(status_code=configure_response.status_code, detail=f"Errore configurazione: {configure_response.text}")
 
             configure_result = configure_response.json()
 
@@ -640,8 +581,7 @@ async def configure_and_load_chain(
             load_response = await client.post(load_url)
 
             if load_response.status_code != 200 and load_response.status_code != 400:
-                raise HTTPException(status_code=load_response.status_code,
-                                    detail=f"Errore caricamento: {load_response.text}")
+                raise HTTPException(status_code=load_response.status_code, detail=f"Errore caricamento: {load_response.text}")
 
             load_result = load_response.json()
 
@@ -658,13 +598,11 @@ async def configure_and_load_chain(
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Errore interno: {str(e)}")
 
-
 # Retrieve info associated with a single context (by ID or name)
 @app.get("/context_info/{context_name}", response_model=Dict[str, Any])
 async def get_context_info(context_name: str):
     result = await create_context_on_server(context_name)
     return result
-
 
 # Chain Execute API Interface
 @app.post("/execute_chain", response_model=Dict[str, Any])
@@ -672,21 +610,19 @@ async def execute_chain(
         chain_id: str = Query(..., title="Chain ID", description="The unique ID of the chain to execute"),
         query: Dict[str, Any] = Body(..., example={"input": "What is my name?", "chat_history": []})):
     async with httpx.AsyncClient() as client:
-        response = await client.post(f"{NLP_CORE_SERVICE}/chains/execute_chain/",
-                                     json={"chain_id": chain_id, "query": query})
+        response = await client.post(f"{NLP_CORE_SERVICE}/chains/execute_chain/", json={"chain_id": chain_id, "query": query})
         if response.status_code != 200:
             raise HTTPException(status_code=response.status_code, detail=response.json())
         return response.json()
-
 
 # Chain Stream API Interface
 @app.post("/stream_chain")
 async def stream_chain(
         chain_id: str = Query(..., title="Chain ID", description="The unique ID of the chain to stream"),
         query: Dict[str, Any] = Body(..., example={"input": "What is my name?", "chat_history": []})):
+
     async with httpx.AsyncClient() as client:
-        async with client.stream("POST", f"{NLP_CORE_SERVICE}/chains/stream_chain/",
-                                 json={"chain_id": chain_id, "query": query}) as response:
+        async with client.stream("POST", f"{NLP_CORE_SERVICE}/chains/stream_chain/", json={"chain_id": chain_id, "query": query}) as response:
             if response.status_code != 200:
                 raise HTTPException(status_code=response.status_code, detail=response.json())
             async for chunk in response.aiter_text():
