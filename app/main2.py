@@ -161,28 +161,27 @@ async def upload_file_to_contexts(file: UploadFile,
                 raise HTTPException(status_code=500, detail="Received invalid JSON response from the server")
 
             # Configure the loader for the uploaded file
-            loader_config_id = f"{context}{file.filename.replace(' ', '')}_loader"
-            doc_store_collection_name = f"{context}{file.filename.replace(' ', '')}_collection"
+            loader_config_id = f"{context}_{file.filename.replace(' ', '_')}_loader"
+            doc_store_collection_name = f"{context}_{file.filename.replace(' ', '_')}_collection"
 
             file_type = file.filename.split(".")[-1].lower()
 
             loaders = {
-                # "pdf": "PyMuPDFLoader",
-                # "txt": "TextLoader",
+                "pdf": "PyMuPDFLoader",
+                "txt": "TextLoader",
                 "png": "ImageDescriptionLoader",
                 "jpg": "ImageDescriptionLoader",
-                "default": "UnstructuredLoader"
             }
 
             kwargs = {
-                # "pdf": {
-                # "pages": None,
-                # "page_chunks": True,
-                # "write_images": False,
-                # "image_size_limit": 0.025,
-                # "embed_images": True,
-                # "image_path": "C:\\Users\\Golden Bit\\Desktop\\projects_in_progress\\GoldenProjects\\golden_bit\\repositories\\nlp-core-api\\tmp",
-                # },
+                "pdf": {
+                    "pages": None,
+                    "page_chunks": True,
+                    "write_images": False,
+                    "image_size_limit": 0.025,
+                    # "embed_images": True,
+                    # "image_path": "C:\\Users\\Golden Bit\\Desktop\\projects_in_progress\\GoldenProjects\\golden_bit\\repositories\\nlp-core-api\\tmp",
+                },
                 "png": {
                     "openai_api_key": get_random_openai_api_key(),
                     "resize_to": (256, 256)
@@ -191,22 +190,17 @@ async def upload_file_to_contexts(file: UploadFile,
                     "openai_api_key": get_random_openai_api_key(),
                     "resize_to": (256, 256)
                 },
-                # "txt": {}
-
-                "default": {
-                    "strategy": "hi_res",
-                    "partition_via_api": False
-                }
+                "txt": {}
             }
 
             loader_config_data = {
                 "config_id": loader_config_id,
                 "path": f"data_stores/data/{context}",
                 "loader_map": {
-                    f"{file.filename.replace(' ', '_')}": loaders.get(file_type) or loaders["default"]
+                    f"{file.filename.replace(' ', '_')}": loaders[file_type]
                 },
                 "loader_kwargs_map": {
-                    f"{file.filename.replace(' ', '_')}": kwargs.get(file_type) or loaders["default"]
+                    f"{file.filename.replace(' ', '_')}": kwargs[file_type]
                 },
                 "metadata_map": {
                     f"{file.filename.replace(' ', '_')}": {
