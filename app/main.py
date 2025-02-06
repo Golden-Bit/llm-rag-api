@@ -206,7 +206,7 @@ async def upload_file_to_contexts(file: UploadFile,
                     f"{file.filename.replace(' ', '_')}": loaders.get(file_type) or loaders["default"]
                 },
                 "loader_kwargs_map": {
-                    f"{file.filename.replace(' ', '_')}": kwargs.get(file_type) or loaders["default"]
+                    f"{file.filename.replace(' ', '_')}": kwargs.get(file_type) or kwargs["default"]
                 },
                 "metadata_map": {
                     f"{file.filename.replace(' ', '_')}": {
@@ -243,12 +243,15 @@ async def upload_file_to_contexts(file: UploadFile,
             # Configure the loader on the original API
             loader_response = await client.post(f"{NLP_CORE_SERVICE}/document_loaders/configure_loader",
                                                 json=loader_config_data)
+            print(loader_response.json())
             if loader_response.status_code != 200 and loader_response.status_code != 400:
                 raise HTTPException(status_code=loader_response.status_code, detail=loader_response.json())
 
             # Apply the loader to process the document
             load_response = await client.post(f"{NLP_CORE_SERVICE}/document_loaders/load_documents/{loader_config_id}",
                                               timeout=timeout_settings)
+
+            print(load_response)
             if load_response.status_code != 200:
                 raise HTTPException(status_code=load_response.status_code, detail=load_response.json())
 
