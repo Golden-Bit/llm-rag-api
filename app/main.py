@@ -171,6 +171,9 @@ async def upload_file_to_contexts(file: UploadFile,
                 # "txt": "TextLoader",
                 "png": "ImageDescriptionLoader",
                 "jpg": "ImageDescriptionLoader",
+                "avi": "VideoDescriptionLoader",
+                "mp4": "VideoDescriptionLoader",
+                "mov": "VideoDescriptionLoader",
                 "default": "UnstructuredLoader"
             }
 
@@ -192,7 +195,24 @@ async def upload_file_to_contexts(file: UploadFile,
                     "resize_to": (256, 256)
                 },
                 # "txt": {}
-
+                "avi": {
+                    "resize_to": [256, 256],  # Dimensione per il resize dei frame
+                    "num_frames": 10,  # Numero di frame da estrarre (opzionale)
+                    #"frame_rate": 2,           # In alternativa, specificare un frame_rate
+                    "openai_api_key": get_random_openai_api_key(),
+                },
+                "mp4": {
+                    "resize_to": [256, 256],  # Dimensione per il resize dei frame
+                    "num_frames": 10,  # Numero di frame da estrarre (opzionale)
+                    #"frame_rate": 2,           # In alternativa, specificare un frame_rate
+                    "openai_api_key": get_random_openai_api_key(),
+                },
+                "mov": {
+                    "resize_to": [256, 256],  # Dimensione per il resize dei frame
+                    "num_frames": 10,  # Numero di frame da estrarre (opzionale)
+                    #"frame_rate": 2,           # In alternativa, specificare un frame_rate
+                    "openai_api_key": get_random_openai_api_key(),
+                },
                 "default": {
                     "strategy": "hi_res",
                     "partition_via_api": False
