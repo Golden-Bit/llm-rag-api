@@ -20,7 +20,7 @@ app = FastAPI(
 REQUIRED_AUTH = False
 
 # Crea un'istanza dell'SDK (configura l'URL base secondo le tue necessità)
-cognito_sdk = CognitoSDK(base_url="https://teatek-llm.theia-innovation.com/llm-rag-with-auth")
+cognito_sdk = CognitoSDK(base_url="https://teatek-llm.theia-innovation.com/auth")
 
 app.add_middleware(
     CORSMiddleware,
