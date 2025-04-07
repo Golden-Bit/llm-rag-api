@@ -14,13 +14,13 @@ from app.auth_sdk.sdk import CognitoSDK, AccessTokenRequest
 from app.system_messages.system_message_1 import SYSTEM_MESSAGE
 
 app = FastAPI(
-    root_path="/llm-rag"
+    root_path="/llm-rag-with-auth"
 )
 
 REQUIRED_AUTH = False
 
 # Crea un'istanza dell'SDK (configura l'URL base secondo le tue necessità)
-cognito_sdk = CognitoSDK(base_url="http://localhost:8000")
+cognito_sdk = CognitoSDK(base_url="https://teatek-llm.theia-innovation.com/llm-rag-with-auth")
 
 app.add_middleware(
     CORSMiddleware,
