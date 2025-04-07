@@ -1,18 +1,26 @@
-from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form, Query, Body
-from pydantic import BaseModel, Field
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Query, Body
+from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 import httpx
 import uuid
 from fastapi.middleware.cors import CORSMiddleware
-
+import hashlib
 import random
 import json
 
 from starlette.responses import StreamingResponse
 
+from app.auth_sdk.sdk import CognitoSDK, AccessTokenRequest
+from app.system_messages.system_message_1 import SYSTEM_MESSAGE
+
 app = FastAPI(
     root_path="/llm-rag"
 )
+
+REQUIRED_AUTH = False
+
+# Crea un'istanza dell'SDK (configura l'URL base secondo le tue necessità)
+cognito_sdk = CognitoSDK(base_url="http://localhost:8000")
 
 app.add_middleware(
     CORSMiddleware,
@@ -45,6 +53,25 @@ class FileUploadResponse(BaseModel):
 def get_random_openai_api_key():
     return random.choice(openai_api_keys)
 
+
+# Definisci la funzione di verifica in un punto centrale del tuo script
+def verify_access_token(token: str | None, sdk_instance) -> None:
+    """
+    Verifica l'access token usando l'SDK.
+
+    Args:
+        token (str): L'access token da verificare.
+        sdk_instance: Un'istanza di CognitoSDK (o altro SDK) con il metodo verify_token.
+
+    Raises:
+        HTTPException: Se l'access token non è valido.
+    """
+    #try:
+    # L'SDK attende un dizionario con la chiave "access_token"
+    print(token)
+    _ = sdk_instance.verify_token(AccessTokenRequest(access_token=token))
+    #except Exception as e:
+    #    raise HTTPException(status_code=401, detail="Access token non valido")
 
 # Helper function to communicate with the existing API
 async def create_context_on_server(context_path: str, metadata: Optional[Dict[str, Any]] = None):
@@ -350,6 +377,10 @@ class CreateContextRequest(BaseModel):
 
 @app.post("/contexts", response_model=ContextMetadata)
 async def create_context(request: CreateContextRequest):
+
+    if REQUIRED_AUTH:
+        verify_access_token(request.token, cognito_sdk)
+
     username = request.username
     token = request.token
 
@@ -368,7 +399,11 @@ async def create_context(request: CreateContextRequest):
 
 # Delete an existing context (directory)
 @app.delete("/contexts/{context_name}", response_model=Dict[str, Any])
-async def delete_context(context_name: str):
+async def delete_context(context_name: str, token: str=None):
+
+    if REQUIRED_AUTH:
+        verify_access_token(token, cognito_sdk)
+
     result = await delete_context_on_server(context_name)
     # TODO: delete related vector store (and all related collection in document store)
     return result
@@ -377,13 +412,16 @@ async def delete_context(context_name: str):
 # List all available contexts
 class ListContextsRequest(BaseModel):
     username: str
-    token: str
+    token: str = None
 
 
 @app.post("/list_contexts", response_model=List[ContextMetadata])
 async def list_contexts(request: ListContextsRequest):
+
+    if REQUIRED_AUTH:
+        verify_access_token(request.token, cognito_sdk)
+
     username = request.username
-    token = request.token
 
     print(f"Listing contexts for user: {username}")
 
@@ -412,11 +450,17 @@ async def list_contexts(request: ListContextsRequest):
 
 # Upload a file to multiple contexts
 @app.post("/upload", response_model=FileUploadResponse)
+
 async def upload_file_to_multiple_contexts(
         file: UploadFile = File(...),
         contexts: List[str] = Form(...),
-        description: Optional[str] = Form(None)
+        description: Optional[str] = Form(None),
+        token: Optional[str] = Form(None)
 ):
+
+    if REQUIRED_AUTH:
+        verify_access_token(token, cognito_sdk)
+
     file_metadata = {"description": description} if description else None
     result = await upload_file_to_contexts(file, contexts, file_metadata)
     return result
@@ -472,20 +516,33 @@ async def delete_file_by_path(file_path: str):
 
 # Endpoint to list files by specific context(s)
 @app.get("/files", response_model=List[Dict[str, Any]])
-async def list_files(contexts: Optional[List[str]] = Query(None)):
+async def list_files(
+        contexts: Optional[List[str]] = Query(None),
+        token: str = Query(None, description="Access token dell'utente"),):
     """
     List files for specific contexts. If no contexts are provided, list all files.
     """
+
+    if REQUIRED_AUTH:
+        verify_access_token(token, cognito_sdk)
+
     result = await list_files_in_context(contexts)
     return result
 
 
 # Endpoint to delete files by either UUID (deletes from all contexts) or path (deletes from a specific context)
 @app.delete("/files")
-async def delete_file(file_id: Optional[str] = Query(None), file_path: Optional[str] = Query(None)):
+async def delete_file(
+        file_id: Optional[str] = Query(None),
+        file_path: Optional[str] = Query(None),
+        token: str = Query(None, description="Access token dell'utente")):
     """
     Delete a file by either its UUID (from all contexts) or its path (from a specific context).
     """
+
+    if REQUIRED_AUTH:
+        verify_access_token(token, cognito_sdk)
+
     if file_id:
         # Delete by UUID from all contexts
         result = await delete_file_by_id(file_id)
@@ -591,9 +648,9 @@ async def configure_and_load_chain_(
 # Modello di input per la configurazione e il caricamento della chain
 class ConfigureAndLoadChainInput(BaseModel):
     contexts: List[str] = []  # Lista di contesti (vuota di default)
-    model_name: Optional[str] = "gpt-4o"  # Nome del modello, default "gpt-4o-mini"
-
-
+    model_name: Optional[str] = "gpt-4o",  # Nome del modello, default "gpt-4o-mini"
+    system_message: Optional[str] = "You are an helpful assistant."
+    token: Optional[str] = None
 @app.post("/configure_and_load_chain/")
 async def configure_and_load_chain(
         input_data: ConfigureAndLoadChainInput  # Usa il modello come input
@@ -602,11 +659,30 @@ async def configure_and_load_chain(
     Configura e carica una chain in memoria basata sul contesto dato.
     """
 
+    if REQUIRED_AUTH:
+        verify_access_token(input_data.token, cognito_sdk)
+
     # Estrai i valori dal modello
     contexts = input_data.contexts
     model_name = input_data.model_name
 
-    id_ = "".join(contexts)
+    ###########################################
+    input_data.system_message = SYSTEM_MESSAGE#
+    ###########################################
+
+    system_message = input_data.system_message
+
+    #id_ = "".join(contexts)
+
+    #id_ = input_data
+
+    # Conversione dell'oggetto in una stringa JSON
+    # sort_keys=True garantisce che le chiavi siano ordinate in modo deterministico
+    json_str = input_data.model_dump_json()
+
+    # Calcolo dell'hash SHA-256 della stringa JSON
+    hash_object = hashlib.sha256(json_str.encode('utf-8'))
+    id_ = hash_object.hexdigest()
 
     timeout_settings = httpx.Timeout(600.0, connect=600.0, read=600.0, write=600.0)
 
@@ -641,13 +717,9 @@ async def configure_and_load_chain(
     # Configurazione della chain
     chain_config = {
         "chain_type": "agent_with_tools",
-        "config_id": f"{id_}_agent_with_tools_config",
-        "chain_id": f"{id_}_agent_with_tools",
-        "system_message": """
-
-        WRITE HERE SYSTEM MESSAGE...
-
-        """,
+        "config_id": f"{id_}_config", #_agent_with_tools_config",
+        "chain_id": f"{id_}", #_agent_with_tools",
+        "system_message": system_message, # #SYSTEM_MESSAGE,
         "llm_id": llm_id,  # Usa l'ID del modello LLM configurato
         "tools": tools
     }
@@ -690,7 +762,11 @@ async def configure_and_load_chain(
 
 # Retrieve info associated with a single context (by ID or name)
 @app.get("/context_info/{context_name}", response_model=Dict[str, Any])
-async def get_context_info(context_name: str):
+async def get_context_info(context_name: str, token: str):
+
+    if REQUIRED_AUTH:
+        verify_access_token(token, cognito_sdk)
+
     result = await create_context_on_server(context_name)
     return result
 
@@ -699,7 +775,12 @@ async def get_context_info(context_name: str):
 @app.post("/execute_chain", response_model=Dict[str, Any])
 async def execute_chain(
         chain_id: str = Query(..., title="Chain ID", description="The unique ID of the chain to execute"),
-        query: Dict[str, Any] = Body(..., example={"input": "What is my name?", "chat_history": []})):
+        query: Dict[str, Any] = Body(..., example={"input": "What is my name?", "chat_history": []}),
+        token: Optional[str] = Body(None)):
+
+    if REQUIRED_AUTH:
+        verify_access_token(token, cognito_sdk)
+
     async with httpx.AsyncClient() as client:
         response = await client.post(f"{NLP_CORE_SERVICE}/chains/execute_chain/",
                                      json={"chain_id": chain_id, "query": query})
@@ -712,7 +793,12 @@ async def execute_chain(
 @app.post("/stream_chain")
 async def stream_chain(
         chain_id: str = Query(..., title="Chain ID", description="The unique ID of the chain to stream"),
-        query: Dict[str, Any] = Body(..., example={"input": "What is my name?", "chat_history": []})):
+        query: Dict[str, Any] = Body(..., example={"input": "What is my name?", "chat_history": []}),
+        token: str = Query(None, title="Token", description="Access token")):
+
+    if REQUIRED_AUTH:
+        verify_access_token(token, cognito_sdk)
+
     async with httpx.AsyncClient() as client:
         async with client.stream("POST", f"{NLP_CORE_SERVICE}/chains/stream_chain/",
                                  json={"chain_id": chain_id, "query": query}) as response:
@@ -723,10 +809,17 @@ async def stream_chain(
 
 
 @app.get("/download", response_class=StreamingResponse)
-async def download_file(file_id: str = Query(..., description="The ID or path of the file to download")):
+async def download_file(
+        file_id: str = Query(..., description="The ID or path of the file to download"),
+        token: str = Query(None, description="Access Token")
+):
     """
     Download a file by its ID via the intermediary API.
     """
+
+    if REQUIRED_AUTH:
+        verify_access_token(token, cognito_sdk)
+
     async with httpx.AsyncClient() as client:
         # Make a GET request to the source API's download endpoint
         response = await client.get(f"{NLP_CORE_SERVICE}/data_stores/download/{file_id}")
