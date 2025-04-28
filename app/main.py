@@ -14,7 +14,7 @@ from app.auth_sdk.sdk import CognitoSDK, AccessTokenRequest
 from app.system_messages.system_message_1 import SYSTEM_MESSAGE
 
 app = FastAPI(
-    root_path="/llm-rag-with-auth"
+    root_path="/llm-rag"
 )
 
 REQUIRED_AUTH = False
