@@ -366,6 +366,57 @@ async def upload_file_to_contexts(file: UploadFile,
 ########################################################################################################################
 ########################################################################################################################
 
+# ----------------------------------------------------------------------
+# UPDATE helpers
+# ----------------------------------------------------------------------
+
+async def update_context_metadata_on_server(
+    context_path: str,
+    description: Optional[str] = None,
+    extra_metadata: Optional[Dict[str, Any]] = None,
+):
+    """Chiama PUT /data_stores/directory/metadata/{context_path}"""
+    payload = {}
+    if description is not None:
+        payload["description"] = description
+    if extra_metadata is not None:
+        payload["extra_metadata"] = json.dumps(extra_metadata)
+
+    async with httpx.AsyncClient() as client:
+        response = await client.put(
+            f"{NLP_CORE_SERVICE}/data_stores/directory/metadata/{context_path}",
+            data=payload,
+        )
+        if response.status_code != 200:
+            raise HTTPException(
+                status_code=response.status_code, detail=response.json()
+            )
+        return response.json()
+
+
+async def update_file_metadata_on_server(
+    file_path: str,
+    description: Optional[str] = None,
+    extra_metadata: Optional[Dict[str, Any]] = None,
+):
+    """Chiama PUT /data_stores/file/metadata/{file_path}"""
+    payload = {}
+    if description is not None:
+        payload["file_description"] = description
+    if extra_metadata is not None:
+        payload["extra_metadata"] = json.dumps(extra_metadata)
+
+    async with httpx.AsyncClient() as client:
+        response = await client.put(
+            f"{NLP_CORE_SERVICE}/data_stores/file/metadata/{file_path}",
+            data=payload,
+        )
+        if response.status_code != 200:
+            raise HTTPException(
+                status_code=response.status_code, detail=response.json()
+            )
+        return response.json()
+
 
 # Create a new context (directory)
 class CreateContextRequest(BaseModel):
@@ -373,6 +424,22 @@ class CreateContextRequest(BaseModel):
     token: str
     context_name: str
     description: Optional[str] = None
+
+class UpdateContextMetadataRequest(BaseModel):
+    username: str
+    token: Optional[str] = None
+    context_name: str
+    description: Optional[str] = None
+    extra_metadata: Optional[Dict[str, Any]] = None
+
+
+class UpdateFileMetadataRequest(BaseModel):
+    token: Optional[str] = None
+    # uno dei due:
+    file_path: Optional[str] = None   # path completo "username-context/filename"
+    file_id: Optional[str] = None     # UUID da custom_metadata.file_uuid
+    description: Optional[str] = None
+    extra_metadata: Optional[Dict[str, Any]] = None
 
 
 @app.post("/contexts", response_model=ContextMetadata)
@@ -553,6 +620,76 @@ async def delete_file(
         raise HTTPException(status_code=400, detail="Either file_id or file_path must be provided")
 
     return result
+
+@app.put("/contexts/metadata", response_model=ContextMetadata)
+async def update_context_metadata(request: UpdateContextMetadataRequest):
+    """
+    Aggiorna (merge) i metadati di un *context* (directory).
+    """
+    if REQUIRED_AUTH:
+        verify_access_token(request.token, cognito_sdk)
+
+    # Il percorso reale sul core = "<username>-<context_name>"
+    context_path = f"{request.username}-{request.context_name}"
+    result = await update_context_metadata_on_server(
+        context_path=context_path,
+        description=request.description,
+        extra_metadata=request.extra_metadata,
+    )
+
+    # Nella risposta rimuoviamo il prefisso "<username>-"
+    result["path"] = result["path"].removeprefix(f"{request.username}-")
+    return result
+
+@app.put("/files/metadata", response_model=Dict[str, Any])
+async def update_file_metadata(
+    request: UpdateFileMetadataRequest
+):
+    """
+    Aggiorna (merge) i metadati di un file.
+    - se `file_path` è fornito => aggiorna solo quel percorso
+    - se `file_id` (UUID) è fornito => aggiorna tutte le copie di quel file nei vari contesti
+    Almeno uno dei due parametri è obbligatorio.
+    """
+    if REQUIRED_AUTH:
+        verify_access_token(request.token, cognito_sdk)
+
+    if not request.file_path and not request.file_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Devi fornire `file_path` oppure `file_id`",
+        )
+
+    updated_items: List[Dict[str, Any]] = []
+
+    # --- caso 1: percorso esplicito -------------------------------------------------
+    if request.file_path:
+        meta = await update_file_metadata_on_server(
+            file_path=request.file_path,
+            description=request.description,
+            extra_metadata=request.extra_metadata,
+        )
+        updated_items.append(meta)
+
+    # --- caso 2: UUID globale -------------------------------------------------------
+    elif request.file_id:
+        # cerchiamo tutti i file con quel UUID e li aggiorniamo uno ad uno
+        files = await list_files_in_context()  # prende tutti i file
+        target_files = [
+            f for f in files if f["custom_metadata"].get("file_uuid") == request.file_id
+        ]
+        if not target_files:
+            raise HTTPException(status_code=404, detail="File UUID non trovato")
+
+        for f in target_files:
+            meta = await update_file_metadata_on_server(
+                file_path=f["path"],
+                description=request.description,
+                extra_metadata=request.extra_metadata,
+            )
+            updated_items.append(meta)
+
+    return {"updated": updated_items}
 
 
 # @app.post("/configure_and_load_chain/")

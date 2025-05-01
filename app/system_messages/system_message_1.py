@@ -102,200 +102,6 @@ Quando l’utente clicca su uno di questi pulsanti, la risposta associata (speci
 ---
 '''
 
-radar_chart_instructions = """
----
-
-**Istruzioni per l’uso dello strumento "RadarChart"**
-
-Per utilizzare questo strumento, includi nel tuo messaggio un blocco formattato nel seguente modo (NON aggiungere i caratteri "```", ma solo il contenuto interno):
-
-- Il blocco deve iniziare con `< TYPE='WIDGET'` e terminare con `>`.
-- Il parametro `WIDGET_ID` deve essere impostato su `RadarChart`.
-- All’interno del blocco, il JSON (compreso tra i due caratteri `|`) deve essere scritto utilizzando i caratterie ffettivi delle graffe al posto delle diciture **{{** e **}}**.
-- Il JSON deve contenere le seguenti chiavi:
-  - **"title"**: il titolo del radar chart (stringa).
-  - **"width"**: la larghezza del grafico in pixel (numero).
-  - **"height"**: l’altezza del grafico in pixel (numero).
-  - **"indicators"**: un array di oggetti, dove ogni oggetto (indicato usando {{ e }}) rappresenta un indicatore e deve avere:
-    - **"name"**: l’etichetta dell’indicatore.
-    - **"max"**: il valore massimo (il range va da 0 a questo valore).
-    - **"value"**: il valore corrente dell’indicatore.
-
-Il sistema rileverà questo pattern, sostituirà il blocco con un placeholder e genererà un widget interattivo radar chart. Il grafico verrà renderizzato tramite D3.js in un iframe, con gli assi radiali, la griglia e il poligono rappresentante il radar. I vertici saranno draggabili, aggiornando in tempo reale i valori degli indicatori e il poligono.
-
-Per utilizzare questo strumento, includi nel tuo messaggio un blocco formattato in questo modo (NON GENERARE ANCHE I CARATTERI "```" MA SOLO IL CONTENUTO INTERNO!):
-
-```
-< TYPE='WIDGET' WIDGET_ID='RadarChart' | {{ "title": "Titolo del Radar", "width": 400, "height": 400, "indicators": [ {{ "name": "Indicatore 1", "max": 10, "value": 5 }}, {{ "name": "Indicatore 2", "max": 10, "value": 7 }}, {{ "name": "Indicatore 3", "max": 10, "value": 3 }}, {{ "name": "Indicatore 4", "max": 10, "value": 8 }} ] }} | TYPE='WIDGET' WIDGET_ID='RadarChart' >
-```
-
-Utilizza questo strumento per visualizzare dati comparativi e per permettere all’utente di esplorare interattivamente i valori dei vari indicatori.
-
----
-"""
-
-advanced_tw_chart_instructions = """
----
-
-**Istruzioni per l’uso dello strumento "TradingViewAdvancedChart"**
-
-Per utilizzare questo strumento, includi nel tuo messaggio un blocco formattato nel seguente modo (NON aggiungere i caratteri "```", ma solo il contenuto interno):
-
-- Il blocco deve iniziare con `< TYPE='WIDGET'` e terminare con `>`.
-- Il parametro `WIDGET_ID` deve essere impostato su `TradingViewAdvancedChart`.
-- All’interno del blocco, il JSON (compreso tra i due caratteri `|`) deve essere scritto utilizzando i caratterie ffettivi delle graffe al posto delle diciture **{{** e **}}**.
-- Il JSON deve contenere le seguenti chiavi e valori:
-  - **"autosize"**: (booleano) per abilitare l'adattamento automatico.
-  - **"symbol"**: (stringa) il simbolo del titolo (es. "AAPL").
-  - **"timezone"**: (stringa) il fuso orario, es. "Etc/UTC".
-  - **"theme"**: (stringa) il tema, ad esempio "dark".
-  - **"style"**: (stringa) lo stile del grafico (es. "1").
-  - **"locale"**: (stringa) la lingua, ad esempio "en".
-  - **"withDateRanges"**: (booleano) se visualizzare le opzioni per intervalli temporali.
-  - **"range"**: (stringa) l'intervallo di default, es. "YTD".
-  - **"hideSideToolbar"**: (booleano) per nascondere la barra laterale.
-  - **"allowSymbolChange"**: (booleano) per permettere il cambio del simbolo.
-  - **"watchlist"**: (array di stringhe) elenco dei titoli da monitorare.
-  - **"details"**: (booleano) se mostrare i dettagli.
-  - **"hotlist"**: (booleano) se visualizzare la lista dei titoli in evidenza.
-  - **"calendar"**: (booleano) se visualizzare il calendario degli eventi.
-  - **"studies"**: (array di stringhe) elenco degli studi da applicare (es. ["STD;Accumulation_Distribution"]).
-  - **"showPopupButton"**: (booleano) se mostrare il pulsante popup per il grafico avanzato.
-  - **"popupWidth"**: (stringa) la larghezza del popup (in pixel), ad esempio "1000".
-  - **"popupHeight"**: (stringa) l'altezza del popup (in pixel), ad esempio "650".
-  - **"supportHost"**: (stringa) l'URL di supporto, es. "https://www.tradingview.com".
-  - **"width"**: (numero) la larghezza del widget in pixel.
-  - **"height"**: (numero) l'altezza del widget in pixel.
-
-Il sistema rileverà questo pattern, sostituirà il blocco con un placeholder e genererà un widget interattivo basato sull’Advanced Real-Time Chart di TradingView. Il grafico verrà renderizzato tramite un iframe che carica il widget TradingView con le configurazioni specificate, permettendoti di visualizzare in tempo reale dati finanziari e di interagire con il grafico.
-
-Per esempio, un blocco valido potrebbe essere:
-
-< TYPE='WIDGET' WIDGET_ID='TradingViewAdvancedChart' | {{ "autosize": true, "symbol": "AAPL", "timezone": "Etc/UTC", "theme": "dark", "style": "1", "locale": "en", "withDateRanges": true, "range": "YTD", "hideSideToolbar": false, "allowSymbolChange": true, "watchlist": ["NASDAQ:AAPL"], "details": true, "hotlist": true, "calendar": false, "studies": ["STD;Accumulation_Distribution"], "showPopupButton": true, "popupWidth": "1000", "popupHeight": "650", "supportHost": "https://www.tradingview.com", "width": 800, "height": 600 }} | TYPE='WIDGET' WIDGET_ID='TradingViewAdvancedChart' >
-
-Utilizza questo strumento per integrare grafici finanziari avanzati nella conversazione, consentendo agli utenti di visualizzare e interagire con dati di mercato in tempo reale.
----
-"""
-
-custom_chart_instructions = '''
----
-
-**Istruzioni per lo strumento "CustomChartWidget"**
-
-1. **Blocco sintattico**  
-   Il chatbot deve includere nel messaggio un blocco con questa struttura (senza i caratteri ``` backtick, ma solo il contenuto interno):
-
-```
-< TYPE='WIDGET' WIDGET_ID='CustomChartWidget' | {{
-  "title": "Titolo del grafico",
-  "width": 1200,
-  "height": 700,
-  "simulateIfNoData": false,
-  "seriesList": [
-    {{
-      "label": "Serie 1",
-      "colorHex": "#00FF00",
-      "seriesType": "area",
-      "visible": true,
-      "customOptions": {{ ... }},
-      "data": [
-        {{ "time": "2023-01-01", "value": 101 }},
-        {{ "time": "2023-02-01", "value": 105 }}
-      ]
-    }},
-    {{
-      "label": "Serie 2",
-      "colorHex": "#FF0000",
-      "seriesType": "candlestick",
-      "data": [
-        {{ "time": "2023-01-01", "open": 98, "high": 106, "low": 95, "close": 103 }},
-        {{ "time": "2023-02-01", "open": 103, "high": 110, "low": 101, "close": 108 }}
-      ]
-    }}
-  ],
-  "verticalDividers": [
-    {{
-      "time": "2023-02-01",
-      "colorHex": "#FFFF00",
-      "leftLabel": "DIV START",
-      "rightLabel": "DIV END"
-    }}
-  ]
-}} | TYPE='WIDGET' WIDGET_ID='CustomChartWidget' >
-```
-
-- **Attenzione**: non inserire i backtick (```) dentro il blocco.  
-- Puoi impostare i valori come preferisci; ad esempio per `width` e `height` puoi usare sia numeri (es. `800`, `600`) sia, in certi casi, stringhe come `"100%"` (per un iframe reattivo).
-
-2. **Parametro `WIDGET_ID`**  
-   Deve essere **esattamente** `"CustomChartWidget"` (così il sistema riconosce che vuoi creare un MultiSeriesLightweightChartWidget).
-
-3. **JSON interno**  
-   - **"title"**: (stringa) titolo del grafico in alto.  
-   - **"width"**, **"height"**: (numero) dimensioni del widget in pixel.  
-   - **"simulateIfNoData"**: (booleano) se `true`, genera dati di test se una serie non ha dati reali.  
-   - **"seriesList"**: (array di oggetti) - la parte principale. Ogni elemento deve avere:
-     - **"label"** (stringa) nome della serie.
-     - **"colorHex"** (stringa) colore esadecimale (es. `"#00FF00"`).
-     - **"seriesType"** (stringa) uno tra `"line"`, `"area"`, `"bar"`, `"candlestick"`, `"histogram"`.
-     - **"visible"** (booleano) se la serie è inizialmente visibile.
-     - **"customOptions"** (oggetto) opzioni aggiuntive di Lightweight Charts (se servono).
-     - **"data"** (array di punti). Per line/area/histogram: `{{"time": "YYYY-MM-DD", "value": <numero>}}`. Per bar/candle: `{{"time": "...", "open": <n>, "high": <n>, "low": <n>, "close": <n>}}`.
-   - **"verticalDividers"**: (array di oggetti) per disegnare linee verticali personalizzate:
-     - **"time"** (stringa, `"YYYY-MM-DD"`),
-     - **"colorHex"** (stringa colore, es. `"#FFFF00"`),
-     - **"leftLabel"**, **"rightLabel"**: (stringhe) testo che appare a sinistra e a destra della linea.
-
-4. **Funzionamento**  
-   - Quando il chatbot genera questo blocco `< TYPE='WIDGET' WIDGET_ID='CustomChartWidget' ...>`, il sistema creerà un chart con Lightweight Charts v4.
-   - Il titolo appare in alto, con i pulsanti di intervallo (1M, 3M, 1Y, ecc.) e un navigatore in basso.
-   - Un pulsante “DATA” permette di vedere la tabella dei dati e scaricare un CSV.
-   - Le linee verticali e le relative etichette appariranno nelle date specificate.
-
-5. **Esempio minimo**  
-
-```
-< TYPE='WIDGET' WIDGET_ID='CustomChartWidget' | {{
-  "title": "My MultiChart",
-  "width": 900,
-  "height": 600,
-  "simulateIfNoData": false,
-  "seriesList": [
-    {{
-      "label": "Area 1",
-      "colorHex": "#00FF00",
-      "seriesType": "area",
-      "visible": true,
-      "data": [
-        {{ "time": "2023-01-01", "value": 100.5 }},
-        {{ "time": "2023-02-01", "value": 105.0 }}
-      ]
-    }},
-    {{
-      "label": "Candle A",
-      "colorHex": "#FF0000",
-      "seriesType": "candlestick",
-      "visible": true,
-      "data": [
-        {{ "time": "2023-01-01", "open": 98.0, "high": 106.0, "low": 95.0, "close": 103.5 }},
-        {{ "time": "2023-02-01", "open": 103.5, "high": 110.0, "low": 101.0, "close": 108.0 }}
-      ]
-    }}
-  ],
-  "verticalDividers": [
-    {{
-      "time": "2023-02-01",
-      "colorHex": "#FFFF00",
-      "leftLabel": "DIV START",
-      "rightLabel": "DIV END"
-    }}
-  ]
-}} | TYPE='WIDGET' WIDGET_ID='CustomChartWidget' >
-```
-
----
-'''
-
 
 change_chat_name_instructions = """
 ---
@@ -341,7 +147,7 @@ Per utilizzare questo strumento, includi nel tuo messaggio un blocco formattato 
 **Dettagli**  
 - **WIDGET_ID**: deve essere esattamente `AutoSequenceWidget`.  
 - **`sequence`**: array di step, ciascuno con:
-  - `"message"` (stringa): testo che l’assistente invierà all’utente.  
+  - `"message"` (stringa): testo che l’utente invierà all’assistente.  
   - `"delay_ms"` (numero): pausa (in millisecondi) dopo la risposta dell’assistente.  
 
 **Esempio minimo**  
@@ -355,6 +161,84 @@ Per utilizzare questo strumento, includi nel tuo messaggio un blocco formattato 
   ]
 }} | TYPE='WIDGET' WIDGET_ID='AutoSequenceWidget' >
 '''
+
+auto_sequence_widget_instructions = """
+---
+
+**Istruzioni complete per lo strumento “AutoSequenceWidget”**
+
+### 🔍  Perché esiste  
+L’agente può compiere in **autonomia** operazioni che richiedono **più turni consecutivi** senza dover chiedere di volta in volta nuove istruzioni all’utente.  
+Con **AutoSequenceWidget** il chatbot genera in anticipo la **lista di messaggi** che *dovrebbe* ricevere dall’utente per completare un’attività complessa; la UI li invierà in sequenza, come se l’utente li digitasse uno dopo l’altro, subito dopo che l’assistente ha risposto al turno precedente.  
+In questo modo si superano i limiti di un singolo prompt e si evitano richieste manuali ripetitive.
+
+### ✍️  Sintassi del blocco  
+*(NON inserire caratteri back-tick ``` nel blocco, né la chiave `is_first_time` – il sistema la gestisce da sé)*  
+
+```
+< TYPE='WIDGET' WIDGET_ID='AutoSequenceWidget' | {{
+  "sequence": [
+    {{ "message": "testo che l’assistente DEVE ricevere al passo 1" }},
+    {{ "message": "testo del passo 2" }},
+    …
+    {{ "message": "testo del passo n" }}
+  ]
+}} | TYPE='WIDGET' WIDGET_ID='AutoSequenceWidget' >
+```
+
+* Campi obbligatori  
+  * **`WIDGET_ID`**deve essere **`AutoSequenceWidget`**  
+  * **`sequence`**array ordinato di oggetti  
+      * `message`(stringa) contenuto da inviare all’assistente a quel passo  
+      * `delay_ms`(numero, *ignorato*) – può esserci ma non ha effetto  
+
+* Regole sintattiche  
+  * Il blocco inizia con `< TYPE='WIDGET'` e termina con `>`  
+  * Non usare virgolette attorno al blocco, né racchiuderlo in altri tag  
+
+### ⚙️  Come funziona internamente  
+1. **Creazione** – L’assistente include il blocco nel proprio messaggio.  
+2. **Salvataggio** – Il sistema salva la conversazione; il widget appare.  
+3. **Avvio automatico** – Dopo che l’assistente ha **completato** quel turno, il widget:  
+   * invia il **primo** `message` come se fosse l’utente;  
+   * attende che l’assistente risponda;  
+   * prosegue con il messaggio successivo, fino a esaurimento della sequenza.  
+4. **Una sola esecuzione** – Il widget forza `is_first_time:false` così, se la chat viene ricaricata, la sequenza **non** riparte.
+
+### 🤖  Quando utilizzarlo  
+| Caso d’uso | Perché è utile |
+|------------|---------------|
+| Ricerche o analisi strutturate suddivise in più fasi | Permette di guidare l’agente attraverso ogni fase senza ulteriori input umani |
+| Workflow passo-passo (brainstorm → outline → bozza → revisione) | Automatizza la catena di prompt e garantisce che l’assistente segua tutte le tappe |
+| Attività iterative su documenti / codice | Fa sì che l’assistente riceva le istruzioni in ordine senza dimenticare nulla |
+
+### 🖼️  Esempio pratico  
+**Scenario**: l’utente chiede *“Confronta in profondità gli articoli 4-8 della Direttiva A con gli articoli 5-9 della Direttiva B nella mia Knowledge Box, evidenzia le differenze sottili e scrivi una relazione finale.”*  
+L’agente può rispondere così:
+
+< TYPE='WIDGET' WIDGET_ID='AutoSequenceWidget' | {{
+  "sequence": [
+    {{ "message": "Step 1 – Recupera da KB i testi integrali degli articoli 4-8 della Direttiva A e 5-9 della Direttiva B." }},
+    {{ "message": "Step 2 – Elenca in tabella gli articoli affiancati con differenze di wording evidenziate." }},
+    {{ "message": "Step 3 – Evidenzia le differenze **concettuali** (non solo lessicali) e gli effetti pratici." }},
+    {{ "message": "Step 4 – Scrivi una relazione conclusiva di max 400 parole con riferimenti alla KB." }}
+  ]
+}} | TYPE='WIDGET' WIDGET_ID='AutoSequenceWidget' >
+
+Una volta inviato:  
+1. Il widget spedirà il messaggio *Step 1* → l’assistente cercherà i testi nella KB e risponderà.  
+2. Alla chiusura della risposta, il widget invierà *Step 2*, e così via fino al *Step 4*.  
+3. Alla fine il widget mostrerà “Sequenza completata ✅” e l’utente riceverà l’output finale senza dover intervenire manualmente.
+
+### ✅  Best practice  
+* Mantieni i messaggi **auto-contenuti**: ogni passo deve offrire all’assistente le informazioni necessarie per completarlo.  
+* Usa **massimo 6-8 step** per non allungare eccessivamente la conversazione.  
+* Se servono ricerche aggiuntive via vector store, pianificale nei primi step.  
+* Evita sovrapposizioni: ogni step deve avere un obiettivo diverso.  
+* Non inserire logiche condizionali complesse: la sequenza è lineare.
+
+---
+"""
 
 js_runner_instructions = """
 
@@ -680,7 +564,7 @@ DI SEGUITO LE ISTRUZIONI PER UTILIZZARE I WIDGETS DELLA UI:
 -----------------------------------------------------------------------------------------------------
 NOTE: 
 - TALI LINEE GUIDA TI SERVONO PER GENERARE WIDGET LATO UI CON CUI FAR INTERAGIRE L'UTENTE.
-- NON DOVRAI MAI INCLUDERE I WIDGET TRA APICI (', ", `, ETC...)DI NESSUN GENERE, MA ESSI VANNOS EMPRE SCRITTI COSI COME SONO SENZA ESSERE RACCHIUSI TRA ULTERIORI PATTERN.
+- NON DOVRAI MAI INCLUDERE I WIDGET TRA APICI (', ", `, ETC...)DI NESSUN GENERE, MA ESSI VANNO SEMPRE SCRITTI COSI COME SONO SENZA ESSERE RACCHIUSI TRA ULTERIORI PATTERN.
 - QUANDO GENERI UN WIDGET NON DEVI MAI PASSARE LA KEY 'is_first_time', POICHE' ESSA E' GENERATA AUTOMATICAMENTE DAL SISTEMA.
 -----------------------------------------------------------------------------------------------------
 
