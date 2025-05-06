@@ -39,6 +39,14 @@ with open("config.json") as config_file:
 NLP_CORE_SERVICE = config["nlp_core_service"]
 openai_api_keys = config["openai_api_keys"]
 
+def short_hash(obj: dict | str, length: int = 9) -> str:
+    """
+    Restituisce i primi `length` caratteri dell'hash SHA‑256
+    calcolato sull'oggetto (dict o stringa) passato.
+    """
+    if not isinstance(obj, str):
+        obj = json.dumps(obj, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(obj.encode("utf-8")).hexdigest()[:length]
 
 # Models for handling requests and responses
 class ContextMetadata(BaseModel):
@@ -1174,6 +1182,9 @@ async def configure_and_load_chain(
     # Calcolo dell'hash SHA-256 della stringa JSON
     hash_object = hashlib.sha256(json_str.encode('utf-8'))
     id_ = hash_object.hexdigest()
+
+    #id_ = short_hash(json_str)
+    id_ = short_hash(str(uuid.uuid4()))
 
     timeout_settings = httpx.Timeout(600.0, connect=600.0, read=600.0, write=600.0)
 
