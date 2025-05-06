@@ -69,12 +69,18 @@ async def delete_context_on_server(context_path: str):
         return response.json()
 
 
-async def list_contexts_from_server():
+async def list_contexts_from_server(prefix: Optional[str] = None):
+    """Chiama /data_stores/directories con eventuale filtro di prefisso."""
+    params = {"prefix": prefix} if prefix else None
     async with httpx.AsyncClient() as client:
-        response = await client.get(f"{NLP_CORE_SERVICE}/data_stores/directories")
+        response = await client.get(
+            f"{NLP_CORE_SERVICE}/data_stores/directories",
+            params=params,
+        )
         if response.status_code != 200:
             raise HTTPException(status_code=response.status_code, detail=response.json())
         return response.json()
+
 
 
 async def upload_file_to_contexts_(file: UploadFile, contexts: List[str],

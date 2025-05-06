@@ -1,0 +1,1 @@
+vedere chat: https://chatgpt.com/c/681378a6-f138-8001-bb69-27de2cf6b8e4
