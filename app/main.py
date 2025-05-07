@@ -1297,15 +1297,30 @@ async def configure_and_load_chain(
             raise HTTPException(status_code=500, detail=f"Errore interno: {str(e)}")
 
 
-# Retrieve info associated with a single context (by ID or name)
-@app.get("/context_info/{context_name}", response_model=Dict[str, Any])
-async def get_context_info(context_name: str, token: str):
-
+# Retrieve metadata for a single context (by full path)
+@app.get("/context_info/{context_path}", response_model=Dict[str, Any])
+async def get_context_info(
+    context_name: str,
+    token: str | None = Query(None, description="Access‑token (facoltativo se REQUIRED_AUTH=False)")
+):
+    """
+    Restituisce le informazioni del contesto indicato da `context_path`.
+    Non crea nulla: cerca tra i context già esistenti.
+    """
+    # ──────────────────────────────────────────────────────────────────────────
     if REQUIRED_AUTH:
         verify_access_token(token, cognito_sdk)
 
-    result = await create_context_on_server(context_name)
-    return result
+    # Recupera l’elenco completo dei context dal core‑service
+    all_ctx = await list_contexts_from_server()          # <- già definita sopra
+
+    # Cerca il path esatto richiesto
+    ctx_info = next((c for c in all_ctx if c["path"] == context_name), None)
+    if ctx_info is None:
+        raise HTTPException(status_code=404, detail="Context not found")
+
+    return ctx_info
+
 
 
 # Chain Execute API Interface
