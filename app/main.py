@@ -1193,7 +1193,7 @@ async def configure_and_load_chain(
     #  - ottenere i metadati dei contesti
     #  - ottenere lista dei file per i contesti
     # --- Nuovo: recupera metadata e file per ciascun context ---
-    contexts_data = []
+    """contexts_data = []
 
     for ctx in contexts:
         # metadata del context
@@ -1205,7 +1205,7 @@ async def configure_and_load_chain(
                 "metadata": ctx_meta,
                 "files": files,
                 "vectorstore_id": f"{ctx}_vector_store"
-        })
+        })"""
 
     system_message += f"""
     ## ISTRUZIONI PER L'UTILIZZO DELLE BASI DI CONOSCENZA
@@ -1215,10 +1215,11 @@ async def configure_and_load_chain(
     - I documenti ni vector store possiedono il metadato 'filename', puoi sfruttare tale campo e la conoscenza sui nomi dei file sorgenti al fine di effettuare ricerche con filtro nel vectorstore, ad esmepio per cercare semanticamente solo tr ai docs associati ad uno specifico file sorgente.
     - In generle ogni qual volta che interagisci con l'utente, valuta se si rende utile effettuare ricerche nel vector store, inoltre se necessario effettua più tentativi di ricerca, aggiustando la query o i filtri se necessario.    
     -----------------------------------------------------------------------------------------------------
-    LE TUE KNOWLEDGE BOXES:
-    {json.dumps(contexts_data, indent=4).replace('{', '{{').replace('}', '}}')}
-    -----------------------------------------------------------------------------------------------------
     """
+    #LE TUE KNOWLEDGE BOXES:
+    #{json.dumps(contexts_data, indent=4).replace('{', '{{').replace('}', '}}')}
+    #-----------------------------------------------------------------------------------------------------
+    #"""
     ####################################################################################################################
 
     # vector_store_config_id = f"{context}_vector_store_config"
