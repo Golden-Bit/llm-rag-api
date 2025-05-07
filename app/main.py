@@ -1216,7 +1216,7 @@ async def configure_and_load_chain(
     - In generle ogni qual volta che interagisci con l'utente, valuta se si rende utile effettuare ricerche nel vector store, inoltre se necessario effettua più tentativi di ricerca, aggiustando la query o i filtri se necessario.    
     -----------------------------------------------------------------------------------------------------
     LE TUE KNOWLEDGE BOXES:
-    {json.dumps(contexts_data, indent=4)}
+    {json.dumps(contexts_data, indent=4).replace('{', '{{').replace('}', '}}')}
     -----------------------------------------------------------------------------------------------------
     """
     ####################################################################################################################
