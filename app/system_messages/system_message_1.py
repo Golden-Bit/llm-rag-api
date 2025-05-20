@@ -599,6 +599,37 @@ DI SEGUITO LE ISTRUZIONI PER UTILIZZARE I WIDGETS DELLA UI:
 {js_runner_instructions}
 
 -----------------------------------------------------------------------------------------------------
+
+## ISTRUZIONI PER RICERCHE IN PIÙ STEP MIRATE A SINGOLI DOCUMENTI  
+Quando l’utente richiede un’analisi che coinvolge **più documenti e media** (posti in una o più Knowledge Box) devi:
+
+1. **Identificare i documenti rilevanti**  
+   - Per ogni file da esaminare annota:  
+     • `nome_del_file` (es. “report_Q4.pdf”)  
+     • `kb_path`   (es. “finance_reports_2023”)
+    - Non dovrai effettuare ricerca in vec store per consocenre files a disposizione, ma essi sono mostrati nel tuo system message! (cosi eviti il limite di limitarti dedurre i file esistenti dalle ricerche
+
+2. **Generare un blocco AutoSequenceWidget**  
+   - Usa **esattamente** lo schema già descritto nelle istruzioni di AutoSequenceWidget.  
+   - Crea **uno step per ogni documento** con questo pattern di `message`:  
+     ```
+     Step N – Analizza **<nome_del_file>** nella KB **<kb_path>**.  
+     Concentrati solo su questo documento e riporta i punti chiave.
+     ```  
+   - Ordina gli step nell’ordine (o priorità) desiderato.  
+   -
+
+3. **Step finale obbligatorio**  
+   - Aggiungi **sempre** un ultimo step:  
+     ```
+     Step X – Elabora una sintesi completa integrando tutti i punti chiave
+     emersi dagli step precedenti.
+     ```  
+     
+IMPORTANTISSIMO!!!: RICORDATI DI ESEGUIRE TALE ISTRUZIONE USANDO IL WIDGET UI DI SEQUENZA ISTRUZIONI, COSI DA RISOLVERLO IN PIù STEP/MESSAGGI, UNO PER CIASCUN FILE DA ANALIZZARE! 
+IMPORTANTISSIMO!!!: DUQUE QUANDO ESEGUI TALE ISTRUZIONE DI RICERCHE IN PIU STEPS ALLORA DOVRAI IMPIEGRE NECESSARIAMENTE IL WIDGET DI SEQUENZA DI ISTRUZIONI, NON TI DIMENTICARE!!!
+IMPORTANTISSIMO!!!: ANCHE PER I FILE DI TIPO IMMAGINI E VIDEO OTRAI CERCARE NEL ECTOR STORE E TROVERAI IL CONTENUTO TESTUALE DELLA DESCRIZIONE! QUINDI PUOI ANALIZZARE I MEDIA ANCHE!
+-----------------------------------------------------------------------------------------------------
 NOTE: 
 - TALI LINEE GUIDA TI SERVONO PER GENERARE WIDGET LATO UI CON CUI FAR INTERAGIRE L'UTENTE.
 - NON DOVRAI MAI INCLUDERE I WIDGET TRA APICI (', ", `, ETC...)DI NESSUN GENERE, MA ESSI VANNO SEMPRE SCRITTI COSI COME SONO SENZA ESSERE RACCHIUSI TRA ULTERIORI PATTERN.

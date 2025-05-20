@@ -1,6 +1,6 @@
 import asyncio
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Query, Body, BackgroundTasks, Depends
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Query, Body, BackgroundTasks, Depends, Path
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
 import httpx
@@ -702,7 +702,8 @@ class CreateContextRequest(BaseModel):
     token: str
     context_name: str          # UUID
     display_name: str          # ⬅️ nuovo
-    description: str | None = None
+    description: Optional[str] = None
+    extra_metadata: Optional[Any] = None
 
 class UpdateContextMetadataRequest(BaseModel):
     username: str
@@ -724,13 +725,10 @@ class UpdateFileMetadataRequest(BaseModel):
 @app.post("/contexts", response_model=ContextMetadata)
 async def create_context(request: CreateContextRequest):
 
-    print(request.model_dump_json())
-
     if REQUIRED_AUTH:
         verify_access_token(request.token, cognito_sdk)
 
     username = request.username
-    token = request.token
 
     print(f"Creating context: {request.context_name} for user: {username}")
 
@@ -741,8 +739,11 @@ async def create_context(request: CreateContextRequest):
         # "owner": username  # Memorizziamo l'username dell'utente che ha creato il contesto
     }  # if request.description else {"owner": username}
 
+    if request.extra_metadata:
+        metadata.update(request.extra_metadata)
+
     result = await create_context_on_server(f"{username}-{request.context_name}", metadata)
-    print(result)
+
     return result
 
 
@@ -825,6 +826,7 @@ async def upload_file_to_multiple_contexts(
         file: UploadFile = File(...),
         contexts: List[str] = Form(...),
         description: Optional[str] = Form(None),
+        extra_metadata: Optional[Any] = Form(None),
         username: Optional[str] = Form(None),
         token: Optional[str] = Form(None)
 ):
@@ -849,6 +851,10 @@ async def upload_file_to_multiple_contexts(
     ####################################################################################################################
 
     file_metadata = {"description": description} if description else None
+
+    if extra_metadata:
+        file_metadata.update(extra_metadata)
+
     result = await upload_file_to_contexts(file, contexts, file_metadata)
     return result
 
@@ -1134,9 +1140,11 @@ async def configure_and_load_chain_(
             }
 
         except httpx.HTTPStatusError as e:
+            print(e)
             raise HTTPException(status_code=e.response.status_code, detail=f"Errore HTTP: {e.response.text}")
 
         except Exception as e:
+            print(e)
             raise HTTPException(status_code=500, detail=f"Errore interno: {str(e)}")
 
 
@@ -1160,7 +1168,7 @@ async def configure_and_load_chain(
 
     if REQUIRED_AUTH:
         verify_access_token(input_data.token, cognito_sdk)
-
+    print(input_data.json())
     # Estrai i valori dal modello
     contexts = input_data.contexts
     model_name = input_data.model_name
@@ -1291,9 +1299,11 @@ async def configure_and_load_chain(
             }
 
         except httpx.HTTPStatusError as e:
+            print(e)
             raise HTTPException(status_code=e.response.status_code, detail=f"Errore HTTP: {e.response.text}")
 
         except Exception as e:
+            print(e)
             raise HTTPException(status_code=500, detail=f"Errore interno: {str(e)}")
 
 
@@ -1402,6 +1412,47 @@ class TasksStatusRequest(BaseModel):
         description="Elenco dei task (loader o vector) da monitorare"
     )
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  Proxy per  **GET /document_stores/documents/{collection_name}/**
+#  (stessa firma e stesso schema di risposta dell’API originale)
+# ─────────────────────────────────────────────────────────────────────────────
+     # ← aggiusta il path se diverso
+
+@app.get("/documents/{collection_name}/") #), response_model=List[DocumentModel])
+async def list_documents_proxy(
+    collection_name: str = Path(..., description="The name of the collection."),
+    prefix: Optional[str] = Query(
+        None, description="Prefix to filter documents (optional)."
+    ),
+    skip: int = Query(0, ge=0, description="Number of documents to skip."),
+    limit: int = Query(10, ge=1, description="Maximum number of documents to return."),
+    token: str = Query(None, description="Access Token")
+):
+    """
+    Re-instrada la richiesta verso l’endpoint originale
+    ``GET /document_stores/documents/{collection_name}/``
+    e restituisce la stessa identica struttura dati.
+    """
+
+    if REQUIRED_AUTH:
+        verify_access_token(token, cognito_sdk)
+
+    params = {"skip": skip, "limit": limit}
+    if prefix:
+        params["prefix"] = prefix
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            f"{NLP_CORE_SERVICE}/document_stores/documents/{collection_name}/",
+            params=params,
+        )
+
+    if resp.status_code != 200:
+        raise HTTPException(status_code=resp.status_code, detail=resp.json())
+
+    # la risposta dell’API originale è già nel formato atteso da `DocumentModel`
+    return resp.json()
+
 
 async def _fetch_single_status(client: httpx.AsyncClient,
                                task_id: str,
@@ -1428,7 +1479,8 @@ async def _fetch_single_status(client: httpx.AsyncClient,
 async def get_tasks_status(
     tasks: List[str] = Query(...,
         description="Task-IDs separati da virgola. "
-                    "Prefissa con loader: o vector: (es.: loader:uuid,vector:uuid)")
+                    "Prefissa con loader: o vector: (es.: loader:uuid,vector:uuid)"),
+    token: str = Query(None, description="Access Token")
 ):
     """
     Ritorna lo stato corrente di tutti i task richiesti.
@@ -1436,12 +1488,13 @@ async def get_tasks_status(
     Esempio:
         /tasks_status?tasks=loader:1234,vector:abcd
     """
-    print("#" * 120)
-    print(tasks)
-    print("---")
+
+    if REQUIRED_AUTH:
+        verify_access_token(token, cognito_sdk)
+
     task_items: List[TaskStatusItem] = []
     for raw in tasks[0].split(","):
-        print(raw)
+
         try:
             kind, tid = raw.split(":", 1)
             task_items.append(TaskStatusItem(task_id=tid, kind=kind))
@@ -1454,9 +1507,7 @@ async def get_tasks_status(
             for itm in task_items
         ]
         results = await asyncio.gather(*coros, return_exceptions=True)
-    print("---")
-    print(results)
-    print("#" * 120)
+
     # costruiamo la risposta
     statuses: Dict[str, Any] = {}
     for itm, res in zip(task_items, results):
@@ -1464,13 +1515,6 @@ async def get_tasks_status(
             statuses[itm.task_id] = {"status": "ERROR", "error": str(res)}
         else:
             statuses[itm.task_id] = res
-
-    print({
-        "requested": len(task_items),
-        "statuses": statuses,
-        "timestamp": datetime.utcnow().isoformat()
-    })
-
 
     return {
         "requested": len(task_items),
