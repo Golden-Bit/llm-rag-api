@@ -68,7 +68,7 @@ async def _post_or_400(client, url: str, **kw):
     return r
 
 
-async def _wait_task_done(client, status_url: str, *, poll_secs: float = 2.0):
+async def _wait_task_done_(client, status_url: str, *, poll_secs: float = 2.0):
     """Attende che lo stato del task diventi DONE o ERROR."""
     while True:
         st = (await client.get(status_url)).json()
@@ -81,6 +81,32 @@ async def _wait_task_done(client, status_url: str, *, poll_secs: float = 2.0):
             await asyncio.sleep(poll_secs)
         except Exception as e:
             print(f"[ERROR]: {e}")
+
+import time
+
+async def _wait_task_done(
+    client,
+    status_url: str,
+    *,
+    poll_secs: float = 5.0,
+    max_wait: float = 1800.0,          # 30 min → scegli tu
+):
+    start = time.monotonic()
+    while True:
+        st = (await client.get(status_url)).json()
+
+        if st["status"] in ("DONE", "ERROR"):
+            if st["status"] == "ERROR":
+                raise HTTPException(500, f"Background task failed: {st['error']}")
+            return st
+
+        if time.monotonic() - start > max_wait:
+            raise HTTPException(
+                504,
+                f"Timeout dopo {max_wait}s in attesa che {status_url} uscisse da PENDING"
+            )
+
+        await asyncio.sleep(poll_secs)
 
 
 def _build_loader_config_payload(
@@ -271,6 +297,11 @@ async def _process_context_pipeline(
         params={"document_collection": coll_name, "task_id": vector_task_id},
     )
 
+    await _wait_task_done(
+        client,
+        f"{NLP_CORE_SERVICE}/vector_stores/vector_store/task_status/{vector_task_id}"
+    )
+
 
 # --------------------------- REWRITE *ENTIRE* helper ---------------------------
 async def upload_file_to_contexts_async(
@@ -367,10 +398,20 @@ async def delete_context_on_server(context_path: str):
         return response.json()
 
 
+
+
 async def list_contexts_from_server(prefix: Optional[str] = None):
     """Chiama /data_stores/directories con eventuale filtro di prefisso."""
     params = {"prefix": prefix} if prefix else None
-    async with httpx.AsyncClient() as client:
+
+    timeout = httpx.Timeout(
+        connect=30.0,  # Tempo massimo per stabilire una connessione
+        read=30.0,  # Tempo massimo per ricevere una risposta
+        write=10.0,  # Tempo massimo per inviare dati
+        pool=10.0  # Tempo massimo per acquisire una connessione dal pool
+    )
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
         response = await client.get(
             f"{NLP_CORE_SERVICE}/data_stores/directories",
             params=params,
@@ -899,7 +940,14 @@ async def upload_file_to_multiple_contexts_async(
 
 # Helper function to list files by context
 async def list_files_in_context(contexts: Optional[List[str]] = None):
-    async with httpx.AsyncClient() as client:
+    timeout = httpx.Timeout(
+        connect=10.0,  # Tempo massimo per stabilire una connessione
+        read=30.0,  # Tempo massimo per ricevere una risposta
+        write=10.0,  # Tempo massimo per inviare dati
+        pool=10.0  # Tempo massimo per acquisire una connessione dal pool
+    )
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
         if contexts:
             # If contexts are provided, filter files by those contexts
             files = []
