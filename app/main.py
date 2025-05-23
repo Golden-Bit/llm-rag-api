@@ -533,32 +533,34 @@ async def upload_file_to_contexts(file: UploadFile,
                 # "image_path": "C:\\Users\\Golden Bit\\Desktop\\projects_in_progress\\GoldenProjects\\golden_bit\\repositories\\nlp-core-api\\tmp",
                 # },
                 "png": {
-                    "openai_api_key": get_random_openai_api_key(),
-                    "resize_to": (256, 256)
-                },
+            "openai_api_key": get_random_openai_api_key(),
+            "resize_to": (1024, 1024),            # ↑ higher baseline
+            "description_mode": "extended",     # ← NEW
+        },
                 "jpg": {
-                    "openai_api_key": get_random_openai_api_key(),
-                    "resize_to": (256, 256)
-                },
+            "openai_api_key": get_random_openai_api_key(),
+            "resize_to": (1024, 1024),            # ↑ higher baseline
+            "description_mode": "extended",     # ← NEW
+        },
                 # "txt": {}
                 "avi": {
-                    "resize_to": [256, 256],  # Dimensione per il resize dei frame
-                    "num_frames": 10,  # Numero di frame da estrarre (opzionale)
-                    #"frame_rate": 2,           # In alternativa, specificare un frame_rate
-                    "openai_api_key": get_random_openai_api_key(),
-                },
+            "resize_to": [1024, 1024],
+            "frame_rate": 0.3,                  # ← sample at 0.3 fps
+            "description_mode": "extended",
+            "openai_api_key": get_random_openai_api_key(),
+        },
                 "mp4": {
-                    "resize_to": [256, 256],  # Dimensione per il resize dei frame
-                    "num_frames": 10,  # Numero di frame da estrarre (opzionale)
-                    #"frame_rate": 2,           # In alternativa, specificare un frame_rate
-                    "openai_api_key": get_random_openai_api_key(),
-                },
+            "resize_to": [1024, 1024],
+            "frame_rate": 0.3,                  # ← sample at 0.3 fps
+            "description_mode": "extended",
+            "openai_api_key": get_random_openai_api_key(),
+        },
                 "mov": {
-                    "resize_to": [256, 256],  # Dimensione per il resize dei frame
-                    "num_frames": 10,  # Numero di frame da estrarre (opzionale)
-                    #"frame_rate": 2,           # In alternativa, specificare un frame_rate
-                    "openai_api_key": get_random_openai_api_key(),
-                },
+            "resize_to": [1024, 1024],
+            "frame_rate": 0.3,                  # ← sample at 0.3 fps
+            "description_mode": "extended",
+            "openai_api_key": get_random_openai_api_key(),
+        },
                 "default": {
                     "strategy": "hi_res",
                     "partition_via_api": False
