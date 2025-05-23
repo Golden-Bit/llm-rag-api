@@ -535,30 +535,30 @@ async def upload_file_to_contexts(file: UploadFile,
                 "png": {
             "openai_api_key": get_random_openai_api_key(),
             "resize_to": (1024, 1024),            # ↑ higher baseline
-            "description_mode": "extended",     # ← NEW
+            #"description_mode": "extended",     # ← NEW
         },
                 "jpg": {
             "openai_api_key": get_random_openai_api_key(),
             "resize_to": (1024, 1024),            # ↑ higher baseline
-            "description_mode": "extended",     # ← NEW
+            #"description_mode": "extended",     # ← NEW
         },
                 # "txt": {}
                 "avi": {
             "resize_to": [1024, 1024],
             "frame_rate": 0.3,                  # ← sample at 0.3 fps
-            "description_mode": "extended",
+            #"description_mode": "extended",
             "openai_api_key": get_random_openai_api_key(),
         },
                 "mp4": {
             "resize_to": [1024, 1024],
             "frame_rate": 0.3,                  # ← sample at 0.3 fps
-            "description_mode": "extended",
+            #"description_mode": "extended",
             "openai_api_key": get_random_openai_api_key(),
         },
                 "mov": {
             "resize_to": [1024, 1024],
             "frame_rate": 0.3,                  # ← sample at 0.3 fps
-            "description_mode": "extended",
+            #"description_mode": "extended",
             "openai_api_key": get_random_openai_api_key(),
         },
                 "default": {
