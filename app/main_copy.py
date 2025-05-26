@@ -1,5 +1,7 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Query, Body
-from pydantic import BaseModel
+import asyncio
+
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Query, Body, BackgroundTasks, Depends, Path
+from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
 import httpx
 import uuid
@@ -7,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import hashlib
 import random
 import json
-
+from datetime import datetime
 from starlette.responses import StreamingResponse
 
 from app.auth_sdk.sdk import CognitoSDK, AccessTokenRequest
@@ -37,6 +39,14 @@ with open("config.json") as config_file:
 NLP_CORE_SERVICE = config["nlp_core_service"]
 openai_api_keys = config["openai_api_keys"]
 
+def short_hash(obj: dict | str, length: int = 9) -> str:
+    """
+    Restituisce i primi `length` caratteri dell'hash SHA‑256
+    calcolato sull'oggetto (dict o stringa) passato.
+    """
+    if not isinstance(obj, str):
+        obj = json.dumps(obj, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(obj.encode("utf-8")).hexdigest()[:length]
 
 # Models for handling requests and responses
 class ContextMetadata(BaseModel):
@@ -47,6 +57,298 @@ class ContextMetadata(BaseModel):
 class FileUploadResponse(BaseModel):
     file_id: str
     contexts: List[str]
+    tasks: Optional[Any]=None
+
+
+async def _post_or_400(client, url: str, **kw):
+    """POST helper con gestione errore standard."""
+    r = await client.post(url, **kw)
+    if r.status_code not in (200, 400):
+        raise HTTPException(r.status_code, detail=r.text)
+    return r
+
+
+async def _wait_task_done_(client, status_url: str, *, poll_secs: float = 2.0):
+    """Attende che lo stato del task diventi DONE o ERROR."""
+    while True:
+        st = (await client.get(status_url)).json()
+        print(st)
+        try:
+            if st["status"] in ("DONE", "ERROR"):
+                if st["status"] == "ERROR":
+                    raise HTTPException(500, f"Background task failed: {st['error']}")
+                return st
+            await asyncio.sleep(poll_secs)
+        except Exception as e:
+            print(f"[ERROR]: {e}")
+
+import time
+
+async def _wait_task_done(
+    client,
+    status_url: str,
+    *,
+    poll_secs: float = 5.0,
+    max_wait: float = 1800.0,          # 30 min → scegli tu
+):
+    start = time.monotonic()
+    while True:
+        st = (await client.get(status_url)).json()
+
+        if st["status"] in ("DONE", "ERROR"):
+            if st["status"] == "ERROR":
+                raise HTTPException(500, f"Background task failed: {st['error']}")
+            return st
+
+        if time.monotonic() - start > max_wait:
+            raise HTTPException(
+                504,
+                f"Timeout dopo {max_wait}s in attesa che {status_url} uscisse da PENDING"
+            )
+
+        await asyncio.sleep(poll_secs)
+
+
+def _build_loader_config_payload(
+    context: str,
+    file: UploadFile,
+    collection_name: str,
+    loader_config_id: str,
+) -> dict:
+    """
+    Crea il payload JSON per /document_loaders/configure_loader
+    basandosi sull'estensione del file e sulle convenzioni già in uso.
+    """
+    file_type = file.filename.split(".")[-1].lower()
+
+    # mappa estensione → loader
+    loaders = {
+        "png": "ImageDescriptionLoader",
+        "jpg": "ImageDescriptionLoader",
+        "jpeg": "ImageDescriptionLoader",
+        "avi": "VideoDescriptionLoader",
+        "mp4": "VideoDescriptionLoader",
+        "mov": "VideoDescriptionLoader",
+        "mkv": "VideoDescriptionLoader",
+        "default": "UnstructuredLoader",
+    }
+
+    # kwargs specifici per ciascun loader (resize, API-key, ecc.)
+    kwargs = {
+        # immagini
+        "png": {
+            "openai_api_key": get_random_openai_api_key(),
+            "resize_to": (256, 256),
+        },
+        "jpg": {
+            "openai_api_key": get_random_openai_api_key(),
+            "resize_to": (256, 256),
+        },
+        "jpeg": {
+            "openai_api_key": get_random_openai_api_key(),
+            "resize_to": (256, 256),
+        },
+        # video
+        "avi": {
+            "resize_to": [256, 256],
+            "num_frames": 10,
+            "openai_api_key": get_random_openai_api_key(),
+        },
+        "mp4": {
+            "resize_to": [256, 256],
+            "num_frames": 10,
+            "openai_api_key": get_random_openai_api_key(),
+        },
+        "mov": {
+            "resize_to": [256, 256],
+            "num_frames": 10,
+            "openai_api_key": get_random_openai_api_key(),
+        },
+        "mkv": {
+            "resize_to": [256, 256],
+            "num_frames": 10,
+            "openai_api_key": get_random_openai_api_key(),
+        },
+        # fallback
+        "default": {
+            "strategy": "hi_res",
+            "partition_via_api": False,
+        },
+    }
+
+    # loader e kwargs selezionati
+    chosen_loader = loaders.get(file_type, loaders["default"])
+    chosen_kwargs = kwargs.get(file_type, kwargs["default"])
+
+    # payload conforme all’endpoint configure_loader
+    return {
+        "config_id": loader_config_id,
+        "path": f"data_stores/data/{context}",
+        "loader_map": {file.filename.replace(" ", "_"): chosen_loader},
+        "loader_kwargs_map": {file.filename.replace(" ", "_"): chosen_kwargs},
+        "metadata_map": {
+            file.filename.replace(" ", "_"): {"source_context": context}
+        },
+        "default_metadata": {"source_context": context},
+        "recursive": True,
+        "max_depth": 5,
+        "silent_errors": True,
+        "load_hidden": True,
+        "show_progress": True,
+        "use_multithreading": True,
+        "max_concurrency": 8,
+        "exclude": ["*.tmp", "*.log"],
+        "sample_size": 10,
+        "randomize_sample": True,
+        "sample_seed": 42,
+        "output_store_map": {
+            file.filename.replace(" ", "_"): {"collection_name": collection_name}
+        },
+        "default_output_store": {"collection_name": collection_name},
+    }
+
+
+async def _ensure_vector_store(
+    context: str,
+    client: httpx.AsyncClient,
+) -> tuple[str, str]:
+    """
+    - genera/configura il vector-store se non esiste
+    - lo carica in memoria (endpoint /load)
+    - restituisce (vector_store_config_id, vector_store_id)
+    """
+    vector_store_config_id = f"{context}_vector_store_config"
+    vector_store_id        = f"{context}_vector_store"
+
+    vector_store_config = {
+        "config_id": vector_store_config_id,
+        "store_id": vector_store_id,
+        "vector_store_class": "Chroma",
+        "params": {"persist_directory": f"vector_stores/{context}"},
+        "embeddings_model_class": "OpenAIEmbeddings",
+        "embeddings_params": {"api_key": get_random_openai_api_key()},
+        "description": f"Vector store for context {context}",
+        "custom_metadata": {"source_context": context},
+    }
+
+    # --- 1. configure (idempotente) -----------------------------------------
+    cfg_resp = await client.post(
+        f"{NLP_CORE_SERVICE}/vector_stores/vector_store/configure",
+        json=vector_store_config,
+    )
+    if cfg_resp.status_code not in (200, 400):          # 400 = già esiste
+        raise HTTPException(cfg_resp.status_code, cfg_resp.text)
+
+    # --- 2. load in RAM ------------------------------------------------------
+    load_resp = await client.post(
+        f"{NLP_CORE_SERVICE}/vector_stores/vector_store/load/{vector_store_config_id}"
+    )
+    if load_resp.status_code not in (200, 400):         # 400 = già caricato
+        raise HTTPException(load_resp.status_code, load_resp.text)
+
+    return vector_store_config_id, vector_store_id
+
+
+async def _process_context_pipeline(
+    ctx: str,
+    file: UploadFile,
+    file_content: bytes,
+    file_uuid: str,
+    file_metadata: dict,
+    loader_task_id: str,
+    vector_task_id: str,
+    client: httpx.AsyncClient,
+):
+    """
+    Esegue TUTTE le operazioni “pesanti” per un singolo context:
+        0. upload raw file
+        1. config loader  + load_documents_async (attesa DONE)
+        2. config vector store (idempotente)      + add_docs_async
+    Tutte le chiamate sono già non-bloccanti vs l'utente; qui le orchestriamo.
+    """
+    # ---------- 0. upload file --------------------------------------------------
+    data  = {
+        "subdir": ctx,
+        "extra_metadata": json.dumps({"file_uuid": file_uuid, **file_metadata})
+    }
+    files = {"file": (file.filename.replace(" ", "_"), file_content, file.content_type)}
+    await _post_or_400(client, f"{NLP_CORE_SERVICE}/data_stores/upload", data=data, files=files)
+
+    # ---------- 1. prepare loader ----------------------------------------------
+    loader_id       = f"{ctx}{file.filename.replace(' ', '')}_loader"
+    coll_name       = f"{ctx}{file.filename.replace(' ', '')}_collection"
+    loader_payload  = _build_loader_config_payload(ctx, file, coll_name, loader_id)
+    await _post_or_400(client, f"{NLP_CORE_SERVICE}/document_loaders/configure_loader", json=loader_payload)
+
+    # lancia il loader in async e aspetta che finisca
+    await _post_or_400(
+        client,
+        f"{NLP_CORE_SERVICE}/document_loaders/load_documents_async/{loader_id}",
+        data={"task_id": loader_task_id},
+    )
+    await _wait_task_done(client, f"{NLP_CORE_SERVICE}/document_loaders/task_status/{loader_task_id}")
+
+    # ---------- 2. config / load vector store ----------------------------------
+    _, vect_id = await _ensure_vector_store(ctx, client)  # idempotente
+
+    await _post_or_400(
+        client,
+        f"{NLP_CORE_SERVICE}/vector_stores/vector_store/add_documents_from_store_async/{vect_id}",
+        params={"document_collection": coll_name, "task_id": vector_task_id},
+    )
+
+    await _wait_task_done(
+        client,
+        f"{NLP_CORE_SERVICE}/vector_stores/vector_store/task_status/{vector_task_id}"
+    )
+
+
+# --------------------------- REWRITE *ENTIRE* helper ---------------------------
+async def upload_file_to_contexts_async(
+    file: UploadFile,
+    contexts: List[str],
+    file_metadata: Optional[Dict[str, Any]] = None,
+    *,                       # ← chiamato dall’endpoint /upload
+    background_tasks: BackgroundTasks,
+):
+    """
+    Orchestratore: prepara i task-id, accoda le pipeline in BackgroundTasks
+    e restituisce subito la mappa <context → {loader_task_id, vector_task_id}>.
+    """
+    timeout       = httpx.Timeout(600.0, connect=600.0, read=600.0, write=600.0)
+    file_uuid     = str(uuid.uuid4())                      # docs.python.org :contentReference[oaicite:3]{index=3}
+    file_content  = await file.read()
+    contexts      = contexts[0].split(",")
+    task_map: Dict[str, Dict[str, str]] = {}
+
+    # Creiamo UN client condiviso per tutti i task (performance)
+    client = httpx.AsyncClient(timeout=timeout)            # httpx docs :contentReference[oaicite:4]{index=4}
+
+    for ctx in contexts:
+        loader_task_id = str(uuid.uuid4())
+        vector_task_id = str(uuid.uuid4())
+        task_map[ctx]  = {
+            "loader_task_id": loader_task_id,
+            "vector_task_id": vector_task_id,
+        }
+
+        # Accoda il worker in background, *niente tracking interno aggiuntivo*.
+        background_tasks.add_task(
+            _process_context_pipeline,
+            ctx,
+            file,
+            file_content,
+            file_uuid,
+            file_metadata or {},
+            loader_task_id,
+            vector_task_id,
+            client,          # passiamo il client già creato
+        )
+
+    # la response torna SUBITO
+    return {"file_id": file_uuid, "contexts": contexts, "tasks": task_map}
+
+
 
 
 # Funzione per selezionare una chiave API casuale
@@ -96,10 +398,20 @@ async def delete_context_on_server(context_path: str):
         return response.json()
 
 
+
+
 async def list_contexts_from_server(prefix: Optional[str] = None):
     """Chiama /data_stores/directories con eventuale filtro di prefisso."""
     params = {"prefix": prefix} if prefix else None
-    async with httpx.AsyncClient() as client:
+
+    timeout = httpx.Timeout(
+        connect=30.0,  # Tempo massimo per stabilire una connessione
+        read=30.0,  # Tempo massimo per ricevere una risposta
+        write=10.0,  # Tempo massimo per inviare dati
+        pool=10.0  # Tempo massimo per acquisire una connessione dal pool
+    )
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
         response = await client.get(
             f"{NLP_CORE_SERVICE}/data_stores/directories",
             params=params,
@@ -221,32 +533,34 @@ async def upload_file_to_contexts(file: UploadFile,
                 # "image_path": "C:\\Users\\Golden Bit\\Desktop\\projects_in_progress\\GoldenProjects\\golden_bit\\repositories\\nlp-core-api\\tmp",
                 # },
                 "png": {
-                    "openai_api_key": get_random_openai_api_key(),
-                    "resize_to": (256, 256)
-                },
+            "openai_api_key": get_random_openai_api_key(),
+            "resize_to": (1024, 1024),            # ↑ higher baseline
+            #"description_mode": "extended",     # ← NEW
+        },
                 "jpg": {
-                    "openai_api_key": get_random_openai_api_key(),
-                    "resize_to": (256, 256)
-                },
+            "openai_api_key": get_random_openai_api_key(),
+            "resize_to": (1024, 1024),            # ↑ higher baseline
+            #"description_mode": "extended",     # ← NEW
+        },
                 # "txt": {}
                 "avi": {
-                    "resize_to": [256, 256],  # Dimensione per il resize dei frame
-                    "num_frames": 10,  # Numero di frame da estrarre (opzionale)
-                    #"frame_rate": 2,           # In alternativa, specificare un frame_rate
-                    "openai_api_key": get_random_openai_api_key(),
-                },
+            "resize_to": [1024, 1024],
+            "frame_rate": 0.3,                  # ← sample at 0.3 fps
+            #"description_mode": "extended",
+            "openai_api_key": get_random_openai_api_key(),
+        },
                 "mp4": {
-                    "resize_to": [256, 256],  # Dimensione per il resize dei frame
-                    "num_frames": 10,  # Numero di frame da estrarre (opzionale)
-                    #"frame_rate": 2,           # In alternativa, specificare un frame_rate
-                    "openai_api_key": get_random_openai_api_key(),
-                },
+            "resize_to": [1024, 1024],
+            "frame_rate": 0.3,                  # ← sample at 0.3 fps
+            #"description_mode": "extended",
+            "openai_api_key": get_random_openai_api_key(),
+        },
                 "mov": {
-                    "resize_to": [256, 256],  # Dimensione per il resize dei frame
-                    "num_frames": 10,  # Numero di frame da estrarre (opzionale)
-                    #"frame_rate": 2,           # In alternativa, specificare un frame_rate
-                    "openai_api_key": get_random_openai_api_key(),
-                },
+            "resize_to": [1024, 1024],
+            "frame_rate": 0.3,                  # ← sample at 0.3 fps
+            #"description_mode": "extended",
+            "openai_api_key": get_random_openai_api_key(),
+        },
                 "default": {
                     "strategy": "hi_res",
                     "partition_via_api": False
@@ -429,8 +743,10 @@ async def update_file_metadata_on_server(
 class CreateContextRequest(BaseModel):
     username: str
     token: str
-    context_name: str
+    context_name: str          # UUID
+    display_name: str          # ⬅️ nuovo
     description: Optional[str] = None
+    extra_metadata: Optional[Any] = None
 
 class UpdateContextMetadataRequest(BaseModel):
     username: str
@@ -456,18 +772,21 @@ async def create_context(request: CreateContextRequest):
         verify_access_token(request.token, cognito_sdk)
 
     username = request.username
-    token = request.token
 
     print(f"Creating context: {request.context_name} for user: {username}")
 
     # Aggiungi username nei metadati del contesto
     metadata = {
+        "display_name": request.display_name,
         "description": request.description,
         # "owner": username  # Memorizziamo l'username dell'utente che ha creato il contesto
     }  # if request.description else {"owner": username}
 
+    if request.extra_metadata:
+        metadata.update(request.extra_metadata)
+
     result = await create_context_on_server(f"{username}-{request.context_name}", metadata)
-    print(result)
+
     return result
 
 
@@ -546,11 +865,11 @@ async def list_contexts(request: ListContextsRequest):
 
 # Upload a file to multiple contexts
 @app.post("/upload", response_model=FileUploadResponse)
-
 async def upload_file_to_multiple_contexts(
         file: UploadFile = File(...),
         contexts: List[str] = Form(...),
         description: Optional[str] = Form(None),
+        extra_metadata: Optional[Any] = Form(None),
         username: Optional[str] = Form(None),
         token: Optional[str] = Form(None)
 ):
@@ -575,13 +894,62 @@ async def upload_file_to_multiple_contexts(
     ####################################################################################################################
 
     file_metadata = {"description": description} if description else None
+
+    if extra_metadata:
+        file_metadata.update(extra_metadata)
+
     result = await upload_file_to_contexts(file, contexts, file_metadata)
     return result
 
 
+@app.post("/upload_async", response_model=FileUploadResponse)
+async def upload_file_to_multiple_contexts_async(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    contexts: List[str] = Form(...),
+    description: Optional[str] = Form(None),
+    username: Optional[str] = Form(None),
+    token: Optional[str] = Form(None),
+):
+
+    if REQUIRED_AUTH:
+        verify_access_token(token, cognito_sdk)
+
+    ####################################################################################################################
+    # TODO:
+    #  - verifica se in path è presente prefisso, altrimenti aggiungi (dovremo richiedere anche username in input)
+
+    if username:
+        formatted_contexts = []
+
+        for context in contexts:
+            if not context.startswith(f"{username}-"):
+                context = f"{username}-{context}"
+            formatted_contexts.append(context)
+
+        contexts = formatted_contexts
+
+    ####################################################################################################################
+
+    file_meta = {"description": description} if description else None
+    return await upload_file_to_contexts_async(
+        file,
+        contexts,
+        file_meta,
+        background_tasks=background_tasks,
+    )
+
+
 # Helper function to list files by context
 async def list_files_in_context(contexts: Optional[List[str]] = None):
-    async with httpx.AsyncClient() as client:
+    timeout = httpx.Timeout(
+        connect=10.0,  # Tempo massimo per stabilire una connessione
+        read=30.0,  # Tempo massimo per ricevere una risposta
+        write=10.0,  # Tempo massimo per inviare dati
+        pool=10.0  # Tempo massimo per acquisire una connessione dal pool
+    )
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
         if contexts:
             # If contexts are provided, filter files by those contexts
             files = []
@@ -822,9 +1190,11 @@ async def configure_and_load_chain_(
             }
 
         except httpx.HTTPStatusError as e:
+            print(e)
             raise HTTPException(status_code=e.response.status_code, detail=f"Errore HTTP: {e.response.text}")
 
         except Exception as e:
+            print(e)
             raise HTTPException(status_code=500, detail=f"Errore interno: {str(e)}")
 
 
@@ -848,7 +1218,7 @@ async def configure_and_load_chain(
 
     if REQUIRED_AUTH:
         verify_access_token(input_data.token, cognito_sdk)
-
+    print(input_data.json())
     # Estrai i valori dal modello
     contexts = input_data.contexts
     model_name = input_data.model_name
@@ -871,10 +1241,47 @@ async def configure_and_load_chain(
     hash_object = hashlib.sha256(json_str.encode('utf-8'))
     id_ = hash_object.hexdigest()
 
+    #id_ = short_hash(json_str)
+    id_ = short_hash(str(uuid.uuid4()))
+
     timeout_settings = httpx.Timeout(600.0, connect=600.0, read=600.0, write=600.0)
+
+    ####################################################################################################################
+    # TODO:
+    #  - ottenere i metadati dei contesti
+    #  - ottenere lista dei file per i contesti
+    # --- Nuovo: recupera metadata e file per ciascun context ---
+    contexts_data = []
+
+    for ctx in contexts:
+        # metadata del context
+        ctx_meta = await get_context_info(ctx, input_data.token)
+        # file associati al context
+        files = await list_files_in_context([ctx])
+        contexts_data.append({
+                "kbox_id": ctx,
+                "metadata": ctx_meta,
+                "files": files,
+                "vectorstore_id": f"{ctx}_vector_store"
+        })
+
+    system_message += f"""
+    ## ISTRUZIONI PER L'UTILIZZO DELLE BASI DI CONOSCENZA
+    -----------------------------------------------------------------------------------------------------
+    - Le knowledge box sono elementi nel quale si caricano file di vario tipo (mostrati dal campo 'files'. Tali files vengono poi processati ed irelativi chunks di testo ottenuti sono poi salvati nel vector store associato e indicato dal campo 'vectorstore_id'.
+    - Quando l'utente ti chiede 'cosa conosci' oppure 'di ocsa parla la tua base di conoscenza', allora dovrai effettuare una ricerca nei vectorstore assoiciati alle tue basi di conoscenza usando l apposito strumento (con query esplorative usate per comprenderne il contenuto).
+    - I documenti ni vector store possiedono il metadato 'filename', puoi sfruttare tale campo e la conoscenza sui nomi dei file sorgenti al fine di effettuare ricerche con filtro nel vectorstore, ad esmepio per cercare semanticamente solo tr ai docs associati ad uno specifico file sorgente.
+    - In generle ogni qual volta che interagisci con l'utente, valuta se si rende utile effettuare ricerche nel vector store, inoltre se necessario effettua più tentativi di ricerca, aggiustando la query o i filtri se necessario.    
+    -----------------------------------------------------------------------------------------------------
+    LE TUE KNOWLEDGE BOXES:
+    {json.dumps(contexts_data, indent=4).replace('{', '{{').replace('}', '}}')}
+    -----------------------------------------------------------------------------------------------------
+    """
+    ####################################################################################################################
 
     # vector_store_config_id = f"{context}_vector_store_config"
     vectorstore_ids = [f"{context}_vector_store" for context in contexts]
+
 
     # Impostazione di configurazione per l'LLM basata su model_name (di default "gpt-4o")
     llm_config_id = f"chat-openai_{model_name}_config"
@@ -894,6 +1301,7 @@ async def configure_and_load_chain(
     # vectorstore_ids = [vector_store_id]
 
     tools = [{"name": "VectorStoreTools", "kwargs": {"store_id": vectorstore_id}} for vectorstore_id in vectorstore_ids]
+
     tools.append({"name": "MongoDBTools",
                   "kwargs": {
                       "connection_string": "mongodb://localhost:27017",
@@ -941,21 +1349,38 @@ async def configure_and_load_chain(
             }
 
         except httpx.HTTPStatusError as e:
+            print(e)
             raise HTTPException(status_code=e.response.status_code, detail=f"Errore HTTP: {e.response.text}")
 
         except Exception as e:
+            print(e)
             raise HTTPException(status_code=500, detail=f"Errore interno: {str(e)}")
 
 
-# Retrieve info associated with a single context (by ID or name)
-@app.get("/context_info/{context_name}", response_model=Dict[str, Any])
-async def get_context_info(context_name: str, token: str):
-
+# Retrieve metadata for a single context (by full path)
+@app.get("/context_info/{context_path}", response_model=Dict[str, Any])
+async def get_context_info(
+    context_name: str,
+    token: str | None = Query(None, description="Access‑token (facoltativo se REQUIRED_AUTH=False)")
+):
+    """
+    Restituisce le informazioni del contesto indicato da `context_path`.
+    Non crea nulla: cerca tra i context già esistenti.
+    """
+    # ──────────────────────────────────────────────────────────────────────────
     if REQUIRED_AUTH:
         verify_access_token(token, cognito_sdk)
 
-    result = await create_context_on_server(context_name)
-    return result
+    # Recupera l’elenco completo dei context dal core‑service
+    all_ctx = await list_contexts_from_server()          # <- già definita sopra
+
+    # Cerca il path esatto richiesto
+    ctx_info = next((c for c in all_ctx if c["path"] == context_name), None)
+    if ctx_info is None:
+        raise HTTPException(status_code=404, detail="Context not found")
+
+    return ctx_info
+
 
 
 # Chain Execute API Interface
@@ -1026,3 +1451,125 @@ async def download_file(
             media_type=content_type,
             headers={"Content-Disposition": content_disposition}
         )
+
+class TaskStatusItem(BaseModel):
+    task_id: str  # UUID del job
+    kind: str #= Field(..., regex="^(loader|vector)$")
+
+class TasksStatusRequest(BaseModel):
+    tasks: List[TaskStatusItem] = Field(
+        ...,
+        description="Elenco dei task (loader o vector) da monitorare"
+    )
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Proxy per  **GET /document_stores/documents/{collection_name}/**
+#  (stessa firma e stesso schema di risposta dell’API originale)
+# ─────────────────────────────────────────────────────────────────────────────
+     # ← aggiusta il path se diverso
+
+@app.get("/documents/{collection_name}/") #), response_model=List[DocumentModel])
+async def list_documents_proxy(
+    collection_name: str = Path(..., description="The name of the collection."),
+    prefix: Optional[str] = Query(
+        None, description="Prefix to filter documents (optional)."
+    ),
+    skip: int = Query(0, ge=0, description="Number of documents to skip."),
+    limit: int = Query(10, ge=1, description="Maximum number of documents to return."),
+    token: str = Query(None, description="Access Token")
+):
+    """
+    Re-instrada la richiesta verso l’endpoint originale
+    ``GET /document_stores/documents/{collection_name}/``
+    e restituisce la stessa identica struttura dati.
+    """
+
+    if REQUIRED_AUTH:
+        verify_access_token(token, cognito_sdk)
+
+    params = {"skip": skip, "limit": limit}
+    if prefix:
+        params["prefix"] = prefix
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            f"{NLP_CORE_SERVICE}/document_stores/documents/{collection_name}/",
+            params=params,
+        )
+
+    if resp.status_code != 200:
+        raise HTTPException(status_code=resp.status_code, detail=resp.json())
+
+    # la risposta dell’API originale è già nel formato atteso da `DocumentModel`
+    return resp.json()
+
+
+async def _fetch_single_status(client: httpx.AsyncClient,
+                               task_id: str,
+                               kind: str) -> Dict[str, Any]:
+    if kind == "loader":
+        url = f"{NLP_CORE_SERVICE}/document_loaders/task_status/{task_id}"
+    elif kind == "vector":
+        url = f"{NLP_CORE_SERVICE}/vector_stores/vector_store/task_status/{task_id}"
+    else:
+        return {"status": "UNKNOWN_KIND"}
+
+    r = await client.get(url)
+
+    if r.status_code == 404:
+        # task not yet registered – report PENDING instead of failing
+        return {"status": "PENDING"}
+    if r.status_code != 200:
+        raise HTTPException(r.status_code, f"Upstream error on {task_id}: {r.text}")
+
+    return r.json()
+
+
+@app.get("/tasks_status", response_model=Dict[str, Any])
+async def get_tasks_status(
+    tasks: List[str] = Query(...,
+        description="Task-IDs separati da virgola. "
+                    "Prefissa con loader: o vector: (es.: loader:uuid,vector:uuid)"),
+    token: str = Query(None, description="Access Token")
+):
+    """
+    Ritorna lo stato corrente di tutti i task richiesti.
+
+    Esempio:
+        /tasks_status?tasks=loader:1234,vector:abcd
+    """
+
+    if REQUIRED_AUTH:
+        verify_access_token(token, cognito_sdk)
+
+    task_items: List[TaskStatusItem] = []
+    for raw in tasks[0].split(","):
+
+        try:
+            kind, tid = raw.split(":", 1)
+            task_items.append(TaskStatusItem(task_id=tid, kind=kind))
+        except ValueError:
+            raise HTTPException(400, f"Formato task non valido: {raw}")
+
+    async with httpx.AsyncClient() as client:
+        coros = [
+            _fetch_single_status(client, itm.task_id, itm.kind)
+            for itm in task_items
+        ]
+        results = await asyncio.gather(*coros, return_exceptions=True)
+
+    # costruiamo la risposta
+    statuses: Dict[str, Any] = {}
+    for itm, res in zip(task_items, results):
+        if isinstance(res, Exception):
+            statuses[itm.task_id] = {"status": "ERROR", "error": str(res)}
+        else:
+            statuses[itm.task_id] = res
+
+    return {
+        "requested": len(task_items),
+        "statuses": statuses,
+        "timestamp": datetime.utcnow().isoformat()
+    }
+
+

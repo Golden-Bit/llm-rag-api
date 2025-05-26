@@ -59,6 +59,26 @@ class FileUploadResponse(BaseModel):
     contexts: List[str]
     tasks: Optional[Any]=None
 
+# ------------------------------------------------------------------
+# NUOVO: descrive la configurazione di un LLM ChatOpenAI
+# ------------------------------------------------------------------
+class LLMConfig(BaseModel):
+    model_name: str = "gpt-4o"          # default
+    temperature: float = 0.25
+    max_tokens: int = 16000
+    max_retries: int = 2
+    api_key: Optional[str] = None       # se None → lo riempiamo runtime
+
+
+def make_llm_ids(cfg: LLMConfig) -> tuple[str, str]:
+    """
+    Ritorna (config_id, model_id) deterministici
+    partendo dal JSON della configurazione.
+    """
+    cfg_json = json.dumps(cfg.model_dump(), sort_keys=True)
+    h = short_hash(cfg_json)                       # 9 caratteri
+    return f"{h}_config", h
+
 
 async def _post_or_400(client, url: str, **kw):
     """POST helper con gestione errore standard."""
@@ -1201,6 +1221,7 @@ async def configure_and_load_chain_(
 # Modello di input per la configurazione e il caricamento della chain
 class ConfigureAndLoadChainInput(BaseModel):
     contexts: List[str] = []  # Lista di contesti (vuota di default)
+    llm: Optional[LLMConfig] = None
     model_name: Optional[str] = "gpt-4o",  # Nome del modello, default "gpt-4o-mini"
     system_message: Optional[str] = "You are an helpful assistant."
     token: Optional[str] = None
@@ -1218,7 +1239,45 @@ async def configure_and_load_chain(
 
     if REQUIRED_AUTH:
         verify_access_token(input_data.token, cognito_sdk)
-    print(input_data.json())
+
+        # ------------------------------------------------------------------
+        # ● STEP 1 – costruiamo la cfg LLM (default + override da utente)
+        # ------------------------------------------------------------------
+    llm_cfg = input_data.llm or LLMConfig()  # default se None
+
+    if input_data.model_name:
+        llm_cfg["model_name"] = input_data.model_name
+
+    if llm_cfg.api_key is None:  # riempi API-key on-the-fly
+        llm_cfg.api_key = get_random_openai_api_key()
+
+    llm_config_id, llm_id = make_llm_ids(llm_cfg)  # ID deterministici
+
+    # ------------------------------------------------------------------
+    # ● STEP 2 – configuriamo il modello (idempotente)
+    # ------------------------------------------------------------------
+    llm_payload = {
+        "config_id": llm_config_id,
+        "model_id": llm_id,
+        "model_type": "ChatOpenAI",
+        "model_kwargs": llm_cfg.model_dump(),
+    }
+
+    timeout = httpx.Timeout(600.0, connect=600.0, read=600.0, write=600.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        # configure_model (potrebbe già esistere → 400 = OK)
+        cfg_resp = await client.post(f"{NLP_CORE_SERVICE}/llms/configure_model/", json=llm_payload)
+        if cfg_resp.status_code not in (200, 400):
+            raise HTTPException(cfg_resp.status_code, cfg_resp.text)
+
+        # load_model (potrebbe già essere in RAM → 400 = OK)
+        llm_load_result = await client.post(f"{NLP_CORE_SERVICE}/llms/load_model/{llm_config_id}")
+        if llm_load_result.status_code not in (200, 400):
+            raise HTTPException(llm_load_result.status_code, llm_load_result.text)
+
+    llm_load_result = llm_load_result.json()
+
+
     # Estrai i valori dal modello
     contexts = input_data.contexts
     model_name = input_data.model_name
@@ -1284,19 +1343,19 @@ async def configure_and_load_chain(
 
 
     # Impostazione di configurazione per l'LLM basata su model_name (di default "gpt-4o")
-    llm_config_id = f"chat-openai_{model_name}_config"
-    llm_id = f"chat-openai_{model_name}"
+    #llm_config_id = f"chat-openai_{model_name}_config"
+    #llm_id = f"chat-openai_{model_name}"
 
-    async with httpx.AsyncClient() as client:
-        # 1. Caricamento dell'LLM
-        load_llm_url = f"{NLP_CORE_SERVICE}/llms/load_model/{llm_config_id}"
-        llm_response = await client.post(load_llm_url, timeout=timeout_settings)
-
-        if llm_response.status_code != 200 and llm_response.status_code != 400:
-            raise HTTPException(status_code=llm_response.status_code,
-                                detail=f"Errore caricamento LLM: {llm_response.text}")
-
-        llm_load_result = llm_response.json()
+    #async with httpx.AsyncClient() as client:
+    #    # 1. Caricamento dell'LLM
+    #    load_llm_url = f"{NLP_CORE_SERVICE}/llms/load_model/{llm_config_id}"
+    #    llm_response = await client.post(load_llm_url, timeout=timeout_settings)
+    #
+    #    if llm_response.status_code != 200 and llm_response.status_code != 400:
+    #        raise HTTPException(status_code=llm_response.status_code,
+    #                            detail=f"Errore caricamento LLM: {llm_response.text}")
+    #
+    #    llm_load_result = llm_response.json()
 
     # vectorstore_ids = [vector_store_id]
 
