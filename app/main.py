@@ -1629,3 +1629,48 @@ async def get_tasks_status(
     }
 
 
+
+class ExecuteChainRequest(BaseModel):
+    chain_id: str = Field(..., example="example_chain", title="Chain ID", description="The unique ID of the chain to execute.")
+    query: Dict[str, Any] = Field(..., example={"input": "What is my name?", "chat_history": [["user", "hello, my name is mario!"], ["assistant", "hello, how are you mario?"]]}, title="Query", description="The input query for the chain.")
+    inference_kwargs: Dict[str, Any] = Field(..., example={}, description="")
+
+
+@app.post("/stream_events_chain")
+async def stream_events_chain(
+    body: ExecuteChainRequest,                  # lo stesso schema usato altrove
+):
+    """
+    Proxy 1-to-1 di **POST /chains/stream_events_chain**:
+    replica I/O byte-per-byte e mantiene lo stream invariato.
+    """
+
+    #if REQUIRED_AUTH:
+    #    verify_access_token(token, cognito_sdk)
+
+    # ------------------------------------------------------------------ #
+    # Wrapper per rilanciare upstream e ributtare giù i chunk “as-is”.   #
+    # ------------------------------------------------------------------ #
+    async def relay():
+        timeout = httpx.Timeout(600.0, connect=600.0, read=600.0, write=600.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            async with client.stream(
+                "POST",
+                f"{NLP_CORE_SERVICE}/chains/stream_events_chain",
+                json=body.model_dump()        # stesso payload del servizio chains
+            ) as resp:
+
+                if resp.status_code != 200:
+                    # Propaga l’errore così com’è
+                    detail = await resp.aread()
+                    raise HTTPException(resp.status_code, detail.decode())
+
+                async for chunk in resp.aiter_bytes():
+                    # **non** modifichiamo né ricomponiamo: passthrough puro
+                    #print(chunk)
+                    yield chunk
+
+    # Il media_type è lo stesso dell’upstream (“application/json”)
+    return StreamingResponse(relay(), media_type="application/json")
+
+
