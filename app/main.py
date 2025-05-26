@@ -1245,9 +1245,6 @@ async def configure_and_load_chain(
         # ------------------------------------------------------------------
     llm_cfg = input_data.llm or LLMConfig()  # default se None
 
-    if input_data.model_name:
-        llm_cfg["model_name"] = input_data.model_name
-
     if llm_cfg.api_key is None:  # riempi API-key on-the-fly
         llm_cfg.api_key = get_random_openai_api_key()
 
