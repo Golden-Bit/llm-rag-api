@@ -1,5 +1,6 @@
 import asyncio
-
+import copy
+from collections.abc import Mapping
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Query, Body, BackgroundTasks, Depends, Path
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
@@ -38,6 +39,25 @@ with open("config.json") as config_file:
 
 NLP_CORE_SERVICE = config["nlp_core_service"]
 openai_api_keys = config["openai_api_keys"]
+
+def deep_merge(base: Mapping, override: Mapping) -> dict:
+    """
+    Ritorna un nuovo dict con merge ricorsivo:
+      • se la chiave esiste in entrambi e i valori sono dict → merge profondo
+      • altrimenti il valore in `override` ha la precedenza
+    """
+    result = copy.deepcopy(base)
+    for key, val in override.items():
+        if (
+            key in result
+            and isinstance(result[key], Mapping)
+            and isinstance(val, Mapping)
+        ):
+            result[key] = deep_merge(result[key], val)
+        else:
+            result[key] = copy.deepcopy(val)
+    return dict(result)
+
 
 def short_hash(obj: dict | str, length: int = 9) -> str:
     """
@@ -134,6 +154,8 @@ def _build_loader_config_payload(
     file: UploadFile,
     collection_name: str,
     loader_config_id: str,
+    custom_loaders: Optional[Dict[str, str]] = None,
+    custom_kwargs: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> dict:
     """
     Crea il payload JSON per /document_loaders/configure_loader
@@ -195,6 +217,16 @@ def _build_loader_config_payload(
             "partition_via_api": False,
         },
     }
+
+    custom_loaders = custom_loaders if custom_loaders else {}
+    custom_kwargs = custom_kwargs if custom_kwargs else {}
+
+    #loaders.update(custom_loaders)
+    #kwargs.update(custom_kwargs)
+
+    # merge profondo con eventuali override
+    loaders      = deep_merge(loaders, custom_loaders or {})
+    kwargs       = deep_merge(kwargs,  custom_kwargs or {})
 
     # loader e kwargs selezionati
     chosen_loader = loaders.get(file_type, loaders["default"])
@@ -278,6 +310,8 @@ async def _process_context_pipeline(
     loader_task_id: str,
     vector_task_id: str,
     client: httpx.AsyncClient,
+    loaders: Optional[Dict[str, str]] = None,
+    loader_kwargs: Optional[Dict[str, Dict[str, Any]]] = None,
 ):
     """
     Esegue TUTTE le operazioni “pesanti” per un singolo context:
@@ -297,7 +331,21 @@ async def _process_context_pipeline(
     # ---------- 1. prepare loader ----------------------------------------------
     loader_id       = f"{ctx}{file.filename.replace(' ', '')}_loader"
     coll_name       = f"{ctx}{file.filename.replace(' ', '')}_collection"
-    loader_payload  = _build_loader_config_payload(ctx, file, coll_name, loader_id)
+    loader_payload  = _build_loader_config_payload(
+        ctx,
+        file,
+        coll_name,
+        loader_id,
+        custom_loaders=loaders,
+        custom_kwargs=loader_kwargs,
+    )
+
+    print("#"*120)
+    print(loaders)
+    print(loader_kwargs)
+
+    print(json.dumps(loader_payload, indent=4))
+
     await _post_or_400(client, f"{NLP_CORE_SERVICE}/document_loaders/configure_loader", json=loader_payload)
 
     # lancia il loader in async e aspetta che finisca
@@ -330,7 +378,11 @@ async def upload_file_to_contexts_async(
     file_metadata: Optional[Dict[str, Any]] = None,
     *,                       # ← chiamato dall’endpoint /upload
     background_tasks: BackgroundTasks,
+    loaders: Optional[Dict[str, str]] = None,
+    loader_kwargs: Optional[Dict[str, Dict[str, Any]]] = None,
 ):
+
+
     """
     Orchestratore: prepara i task-id, accoda le pipeline in BackgroundTasks
     e restituisce subito la mappa <context → {loader_task_id, vector_task_id}>.
@@ -362,7 +414,9 @@ async def upload_file_to_contexts_async(
             file_metadata or {},
             loader_task_id,
             vector_task_id,
-            client,          # passiamo il client già creato
+            client,
+            loaders,
+            loader_kwargs# passiamo il client già creato
         )
 
     # la response torna SUBITO
@@ -486,7 +540,10 @@ async def upload_file_to_contexts_(file: UploadFile, contexts: List[str],
 
 async def upload_file_to_contexts(file: UploadFile,
                                   contexts: List[str],
-                                  file_metadata: Optional[Dict[str, Any]] = None):
+                                  file_metadata: Optional[Dict[str, Any]] = None,
+                                  loaders: Optional[Dict[str, str]] = None,
+                                  loader_kwargs: Optional[Dict[str, Dict[str, Any]]] = None,
+                                  ):
     file_uuid = str(uuid.uuid4())  # Generate a UUID for the file
     file_content = await file.read()  # Read the file content once and reuse it
 
@@ -891,7 +948,9 @@ async def upload_file_to_multiple_contexts(
         description: Optional[str] = Form(None),
         extra_metadata: Optional[Any] = Form(None),
         username: Optional[str] = Form(None),
-        token: Optional[str] = Form(None)
+        token: Optional[str] = Form(None),
+        loaders: Optional[str] = Form(None),
+        loader_kwargs: Optional[str] = Form(None),
 ):
 
     if REQUIRED_AUTH:
@@ -913,12 +972,27 @@ async def upload_file_to_multiple_contexts(
 
     ####################################################################################################################
 
+    try:
+        loaders_dict: Dict[str, str] | None = json.loads(loaders) if loaders else None
+        kwargs_dict: Dict[str, Dict[str, Any]] | None = (
+            json.loads(loader_kwargs) if loader_kwargs else None
+        )
+    except json.JSONDecodeError as e:
+        raise HTTPException(422, f"Parametri JSON non validi: {e}")
+
     file_metadata = {"description": description} if description else None
 
     if extra_metadata:
         file_metadata.update(extra_metadata)
 
-    result = await upload_file_to_contexts(file, contexts, file_metadata)
+    result = await upload_file_to_contexts(
+        file,
+        contexts,
+        file_metadata,
+        loaders=loaders_dict,
+        loader_kwargs=kwargs_dict
+    )
+
     return result
 
 
@@ -930,6 +1004,8 @@ async def upload_file_to_multiple_contexts_async(
     description: Optional[str] = Form(None),
     username: Optional[str] = Form(None),
     token: Optional[str] = Form(None),
+    loaders: Optional[str] = Form(None),
+    loader_kwargs: Optional[str] = Form(None),
 ):
 
     if REQUIRED_AUTH:
@@ -951,12 +1027,22 @@ async def upload_file_to_multiple_contexts_async(
 
     ####################################################################################################################
 
+    try:
+        loaders_dict: Dict[str, str] | None = json.loads(loaders) if loaders else None
+        kwargs_dict: Dict[str, Dict[str, Any]] | None = (
+            json.loads(loader_kwargs) if loader_kwargs else None
+        )
+    except json.JSONDecodeError as e:
+        raise HTTPException(422, f"Parametri JSON non validi: {e}")
+
     file_meta = {"description": description} if description else None
     return await upload_file_to_contexts_async(
         file,
         contexts,
         file_meta,
         background_tasks=background_tasks,
+        loaders=loaders_dict,
+        loader_kwargs=kwargs_dict,
     )
 
 
@@ -1673,4 +1759,228 @@ async def stream_events_chain(
     # Il media_type è lo stesso dell’upstream (“application/json”)
     return StreamingResponse(relay(), media_type="application/json")
 
+
+@app.get("/loaders_catalog", response_model=dict)
+async def loaders_catalog():
+    """
+    Ritorna una mappa { <estensione_file>: [<loader1>, <loader2>, ...] }
+    con i loader predefiniti disponibili per ciascuna estensione.
+    """
+    return {
+        "png":  ["ImageDescriptionLoader"],
+        "jpg":  ["ImageDescriptionLoader"],
+        "jpeg": ["ImageDescriptionLoader"],
+        "avi":  ["VideoDescriptionLoader"],
+        "mp4":  ["VideoDescriptionLoader", "VideoEventDetectionLoader"],
+        "mov":  ["VideoDescriptionLoader"],
+        "mkv":  ["VideoDescriptionLoader"],
+        "default": ["UnstructuredLoader"]
+    }
+
+@app.get("/loader_kwargs_schema", response_model=dict)
+async def loader_kwargs_schema():
+    """
+    Ritorna lo schema dei parametri per ciascun loader.
+    Ogni campo contiene: name, type, default, items (se enum), example ed editable.
+    """
+    return {
+        "ImageDescriptionLoader": {
+            "openai_api_key": {
+                "name": "openai_api_key",
+                "type": "string",
+                "default": "<random-api-key>",
+                "items": None,
+                "example": "sk-abc123",
+                "editable": False
+            },
+            "resize_to": {
+                "name": "resize_to",
+                "type": "tuple[int,int]",
+                "default": [256, 256],
+                "items": None,
+                "example": [1024, 1024]
+            }
+        },
+        "VideoDescriptionLoader": {
+            "openai_api_key": {
+                "name": "openai_api_key",
+                "type": "string",
+                "default": "<random-api-key>",
+                "items": None,
+                "example": "sk-xyz789",
+                "editable": False
+            },
+            "resize_to": {
+                "name": "resize_to",
+                "type": "list[int,int]",
+                "default": [256, 256],
+                "items": None,
+                "example": [1024, 1024]
+            },
+            "num_frames": {
+                "name": "num_frames",
+                "type": "int",
+                "default": 10,
+                "items": None,
+                "example": 20
+            },
+            "frame_rate": {
+                "name": "frame_rate",
+                "type": "int",
+                "default": None,
+                "items": None,
+                "example": 2
+            }
+        },
+        "VideoEventDetectionLoader": {
+            "openai_api_key": {
+                "name": "openai_api_key",
+                "type": "string",
+                "default": "<random-api-key>",
+                "items": None,
+                "example": "sk-evt000",
+                "editable": False
+            },
+            "resize_to": {
+                "name": "resize_to",
+                "type": "list[int,int]",
+                "default": [256, 256],
+                "items": None,
+                "example": [640, 640]
+            },
+            "frame_rate": {
+                "name": "frame_rate",
+                "type": "int",
+                "default": None,
+                "items": None,
+                "example": 1
+            },
+            "num_frames": {
+                "name": "num_frames",
+                "type": "int",
+                "default": None,
+                "items": None,
+                "example": 500
+            },
+            "window_size_seconds": {
+                "name": "window_size_seconds",
+                "type": "int",
+                "default": 10,
+                "items": None,
+                "example": 3
+            },
+            "window_overlap_seconds": {
+                "name": "window_overlap_seconds",
+                "type": "int",
+                "default": 2,
+                "items": None,
+                "example": 1
+            },
+            "batch_size": {
+                "name": "batch_size",
+                "type": "int",
+                "default": 4,
+                "items": None,
+                "example": 20
+            },
+            "max_concurrency": {
+                "name": "max_concurrency",
+                "type": "int",
+                "default": 10,
+                "items": None,
+                "example": 20
+            },
+            "event_prompt": {
+                "name": "event_prompt",
+                "type": "string",
+                "default": "",
+                "items": None,
+                "example": "Rileva tutte le volte in cui compare una macchina."
+            }
+        },
+        "UnstructuredLoader": {
+            "strategy": {
+                "name": "strategy",
+                "type": "string",
+                "default": "hi_res",
+                "items": ["hi_res", "fast", "auto"],
+                "example": "fast"
+            },
+            "partition_via_api": {
+                "name": "partition_via_api",
+                "type": "boolean",
+                "default": False,
+                "example": True
+            }
+        }
+    }
+
+
+'''
+@app.get("/loader_kwargs_schema", response_model=dict)
+async def loader_kwargs_schema():
+    """
+    Ritorna lo *schema* dei parametri per ciascun loader.
+    Ogni campo viene descritto con: name, type, default, items (null
+    se non applicabile) ed example.
+    """
+    return {
+        "ImageDescriptionLoader": {
+            "openai_api_key": {
+                "name": "openai_api_key",
+                "type": "string",
+                "default": "<random-api-key>",
+                "items": None,
+                "example": "sk-abc123",
+                "editable": False,
+            },
+            "resize_to": {
+                "name": "resize_to",
+                "type": "tuple[int,int]",
+                "default": [256, 256],
+                "items": None,
+                "example": [1024, 1024]
+            }
+        },
+        "VideoDescriptionLoader": {
+            "openai_api_key": {
+                "name": "openai_api_key",
+                "type": "string",
+                "default": "<random-api-key>",
+                "items": None,
+                "example": "sk-xyz789",
+                "editable": False,
+            },
+            "resize_to": {
+                "name": "resize_to",
+                "type": "list[int,int]",
+                "default": [256, 256],
+                "items": None,
+                "example": [1024, 1024]
+            },
+            "num_frames": {
+                "name": "num_frames",
+                "type": "int",
+                "default": 10,
+                "items": None,
+                "example": 20
+            }
+        },
+        "UnstructuredLoader": {
+            "strategy": {
+                "name": "strategy",
+                "type": "string",
+                "default": "hi_res",
+                "items": ["hi_res", "fast", "auto"],
+                "example": "fast"
+            },
+            "partition_via_api": {
+                "name": "partition_via_api",
+                "type": "boolean",
+                "default": False,
+                "example": True
+            }
+        }
+    }
+'''
 
