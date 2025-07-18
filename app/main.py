@@ -4,15 +4,22 @@ from collections.abc import Mapping
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Query, Body, BackgroundTasks, Depends, Path
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
-import httpx
 import uuid
 from fastapi.middleware.cors import CORSMiddleware
 import hashlib
 import random
-import json
 from datetime import datetime
 from starlette.responses import StreamingResponse
-
+from io import BytesIO
+from pathlib import Path
+from PyPDF2 import PdfReader
+from pydantic import BaseModel
+from pptx import Presentation
+import docx
+from PIL import Image, TiffImagePlugin
+import tempfile
+import os, math, json
+import httpx
 from app.auth_sdk.sdk import CognitoSDK, AccessTokenRequest
 from app.system_messages.system_message_1 import SYSTEM_MESSAGE
 
@@ -40,11 +47,23 @@ with open("config.json") as config_file:
 NLP_CORE_SERVICE = config["nlp_core_service"]
 openai_api_keys = config["openai_api_keys"]
 
+# ------------------------------------------------------------------
+# Vector‑store IDs  ← hash(JSON(cfg))
+# ------------------------------------------------------------------
+def make_vector_store_ids(cfg: Mapping) -> tuple[str, str]:
+    """
+    Ritorna (config_id, store_id) deterministici partendo dal JSON
+    della configurazione (ordinato).
+    """
+    cfg_json = json.dumps(cfg, sort_keys=True, ensure_ascii=False)
+    h = short_hash(cfg_json)                   # 9 caratteri
+    return (f"{h}_vector_store_config", h)
+
 def deep_merge(base: Mapping, override: Mapping) -> dict:
     """
     Ritorna un nuovo dict con merge ricorsivo:
       • se la chiave esiste in entrambi e i valori sono dict → merge profondo
-      • altrimenti il valore in `override` ha la precedenza
+      • altrimenti il valore in override ha la precedenza
     """
     result = copy.deepcopy(base)
     for key, val in override.items():
@@ -61,7 +80,7 @@ def deep_merge(base: Mapping, override: Mapping) -> dict:
 
 def short_hash(obj: dict | str, length: int = 9) -> str:
     """
-    Restituisce i primi `length` caratteri dell'hash SHA‑256
+    Restituisce i primi length caratteri dell'hash SHA‑256
     calcolato sull'oggetto (dict o stringa) passato.
     """
     if not isinstance(obj, str):
@@ -269,7 +288,7 @@ async def _ensure_vector_store(
     - lo carica in memoria (endpoint /load)
     - restituisce (vector_store_config_id, vector_store_id)
     """
-    vector_store_config_id = f"{context}_vector_store_config"
+    '''vector_store_config_id = f"{context}_vector_store_config"
     vector_store_id        = f"{context}_vector_store"
 
     vector_store_config = {
@@ -281,6 +300,22 @@ async def _ensure_vector_store(
         "embeddings_params": {"api_key": get_random_openai_api_key()},
         "description": f"Vector store for context {context}",
         "custom_metadata": {"source_context": context},
+    }'''
+    base_cfg = {  # ← solo la “sostanza”
+                "vector_store_class": "Chroma",
+                "params": {"persist_directory": f"vector_stores/{context}"},
+                "embeddings_model_class": "OpenAIEmbeddings",
+                "embeddings_params": {"api_key": get_random_openai_api_key()},
+                "description": f"Vector store for context {context}",
+                "custom_metadata": {"source_context": context},
+        }
+
+    vector_store_config_id, vector_store_id = make_vector_store_ids(base_cfg)
+
+    vector_store_config = {  # ← ora aggiungiamo gli ID
+                "config_id": vector_store_config_id,
+                "store_id": vector_store_id,
+        **base_cfg
     }
 
     # --- 1. configure (idempotente) -----------------------------------------
@@ -1167,8 +1202,8 @@ async def update_file_metadata(
 ):
     """
     Aggiorna (merge) i metadati di un file.
-    - se `file_path` è fornito => aggiorna solo quel percorso
-    - se `file_id` (UUID) è fornito => aggiorna tutte le copie di quel file nei vari contesti
+    - se file_path è fornito => aggiorna solo quel percorso
+    - se file_id (UUID) è fornito => aggiorna tutte le copie di quel file nei vari contesti
     Almeno uno dei due parametri è obbligatorio.
     """
     if REQUIRED_AUTH:
@@ -1177,7 +1212,7 @@ async def update_file_metadata(
     if not request.file_path and not request.file_id:
         raise HTTPException(
             status_code=400,
-            detail="Devi fornire `file_path` oppure `file_id`",
+            detail="Devi fornire file_path oppure file_id",
         )
 
     updated_items: List[Dict[str, Any]] = []
@@ -1308,9 +1343,56 @@ async def configure_and_load_chain_(
 class ConfigureAndLoadChainInput(BaseModel):
     contexts: List[str] = []  # Lista di contesti (vuota di default)
     llm: Optional[LLMConfig] = None
-    model_name: Optional[str] = "gpt-4o",  # Nome del modello, default "gpt-4o-mini"
+    model_name: Optional[str] = "gpt-4o"  # Nome del modello, default "gpt-4o-mini"
     system_message: Optional[str] = "You are an helpful assistant."
     token: Optional[str] = None
+
+# -----------------------------------------------------------------------------
+# Costruzione “base” e bootstrap di un vector‑store (config + load)
+# -----------------------------------------------------------------------------
+def _build_vs_base_cfg(ctx: str, api_key: str) -> dict:
+    """Restituisce la cfg minima (usata anche per l’hash)."""
+    return {
+        "vector_store_class": "Chroma",
+        "params": {"persist_directory": f"vector_stores/{ctx}"},
+        "embeddings_model_class": "OpenAIEmbeddings",
+        "embeddings_params": {"api_key": api_key},
+        "description": f"Vector store for context {ctx}",
+        "custom_metadata": {"source_context": ctx},
+    }
+
+
+async def _ensure_vs_exists(
+    ctx: str,
+    api_key: str,
+    client: httpx.AsyncClient,
+) -> str:
+    """
+    • se il VS (cfg + load) esiste già ⇒ lo carica (idempotente)
+    • altrimenti lo configura e poi lo carica
+    → ritorna sempre lo **store_id** da usare negli strumenti.
+    """
+    base_cfg = _build_vs_base_cfg(ctx, api_key)
+    cfg_id, store_id = make_vector_store_ids(base_cfg)
+
+    vs_cfg = {"config_id": cfg_id, "store_id": store_id, **base_cfg}
+
+    # 1. configure  (200 = creato, 400 = già presente)
+    resp = await client.post(
+        f"{NLP_CORE_SERVICE}/vector_stores/vector_store/configure",
+        json=vs_cfg,
+    )
+    if resp.status_code not in (200, 400):
+        raise HTTPException(resp.status_code, resp.text)
+
+    # 2. load in RAM  (200 = ok, 400 = già in RAM)
+    resp = await client.post(
+        f"{NLP_CORE_SERVICE}/vector_stores/vector_store/load/{cfg_id}"
+    )
+    if resp.status_code not in (200, 400):
+        raise HTTPException(resp.status_code, resp.text)
+
+    return store_id
 
 #TODO:
 # - assicurarsi che tutti gli oggetti (inclusi vec sotre e llm) siano configurati e caricati usando id derivati da ash della
@@ -1329,7 +1411,9 @@ async def configure_and_load_chain(
         # ------------------------------------------------------------------
         # ● STEP 1 – costruiamo la cfg LLM (default + override da utente)
         # ------------------------------------------------------------------
+    model_name = input_data.model_name
     llm_cfg = input_data.llm or LLMConfig()  # default se None
+    if model_name: llm_cfg.model_name = model_name
 
     if llm_cfg.api_key is None:  # riempi API-key on-the-fly
         llm_cfg.api_key = get_random_openai_api_key()
@@ -1363,7 +1447,6 @@ async def configure_and_load_chain(
 
     # Estrai i valori dal modello
     contexts = input_data.contexts
-    model_name = input_data.model_name
 
     ###########################################
     input_data.system_message = SYSTEM_MESSAGE#
@@ -1422,8 +1505,31 @@ async def configure_and_load_chain(
     ####################################################################################################################
 
     # vector_store_config_id = f"{context}_vector_store_config"
-    vectorstore_ids = [f"{context}_vector_store" for context in contexts]
+    '''vectorstore_ids = [f"{context}_vector_store" for context in contexts]'''
 
+    '''vectorstore_ids = []
+
+    for ctx in contexts:
+        # ricostruisci lo stesso base_cfg usato da _ensure_vector_store
+        _base = {
+                "vector_store_class": "Chroma",
+                "params": {"persist_directory": f"vector_stores/{ctx}"},
+                "embeddings_model_class": "OpenAIEmbeddings",
+                "embeddings_params": {},  # valori non influenti per l'hash
+                "description": f"Vector store for context {ctx}",
+                "custom_metadata": {"source_context": ctx},
+        }
+        _, vs_id = make_vector_store_ids(_base)
+        vectorstore_ids.append(vs_id)'''
+    # ------------------------------------------------------------------
+    # ● STEP 3 – assicuriamoci che ESISTA un VS per ogni context
+    #            (nuovo ID se la api_key cambia)
+    # ------------------------------------------------------------------
+    vectorstore_ids: List[str] = []
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        for ctx in contexts:
+            vs_id = await _ensure_vs_exists(ctx, llm_cfg.api_key, client)
+            vectorstore_ids.append(vs_id)
 
     # Impostazione di configurazione per l'LLM basata su model_name (di default "gpt-4o")
     #llm_config_id = f"chat-openai_{model_name}_config"
@@ -1506,7 +1612,7 @@ async def get_context_info(
     token: str | None = Query(None, description="Access‑token (facoltativo se REQUIRED_AUTH=False)")
 ):
     """
-    Restituisce le informazioni del contesto indicato da `context_path`.
+    Restituisce le informazioni del contesto indicato da context_path.
     Non crea nulla: cerca tra i context già esistenti.
     """
     # ──────────────────────────────────────────────────────────────────────────
@@ -1612,7 +1718,7 @@ class TasksStatusRequest(BaseModel):
 
 @app.get("/documents/{collection_name}/") #), response_model=List[DocumentModel])
 async def list_documents_proxy(
-    collection_name: str = Path(..., description="The name of the collection."),
+    collection_name: str = Path("", description="The name of the collection."),
     prefix: Optional[str] = Query(
         None, description="Prefix to filter documents (optional)."
     ),
@@ -1622,7 +1728,7 @@ async def list_documents_proxy(
 ):
     """
     Re-instrada la richiesta verso l’endpoint originale
-    ``GET /document_stores/documents/{collection_name}/``
+    `GET /document_stores/documents/{collection_name}/
     e restituisce la stessa identica struttura dati.
     """
 
@@ -1642,7 +1748,7 @@ async def list_documents_proxy(
     if resp.status_code != 200:
         raise HTTPException(status_code=resp.status_code, detail=resp.json())
 
-    # la risposta dell’API originale è già nel formato atteso da `DocumentModel`
+    # la risposta dell’API originale è già nel formato atteso da DocumentModel
     return resp.json()
 
 
@@ -1916,71 +2022,402 @@ async def loader_kwargs_schema():
     }
 
 
-'''
-@app.get("/loader_kwargs_schema", response_model=dict)
-async def loader_kwargs_schema():
-    """
-    Ritorna lo *schema* dei parametri per ciascun loader.
-    Ogni campo viene descritto con: name, type, default, items (null
-    se non applicabile) ed example.
-    """
-    return {
-        "ImageDescriptionLoader": {
-            "openai_api_key": {
-                "name": "openai_api_key",
-                "type": "string",
-                "default": "<random-api-key>",
-                "items": None,
-                "example": "sk-abc123",
-                "editable": False,
-            },
-            "resize_to": {
-                "name": "resize_to",
-                "type": "tuple[int,int]",
-                "default": [256, 256],
-                "items": None,
-                "example": [1024, 1024]
-            }
-        },
-        "VideoDescriptionLoader": {
-            "openai_api_key": {
-                "name": "openai_api_key",
-                "type": "string",
-                "default": "<random-api-key>",
-                "items": None,
-                "example": "sk-xyz789",
-                "editable": False,
-            },
-            "resize_to": {
-                "name": "resize_to",
-                "type": "list[int,int]",
-                "default": [256, 256],
-                "items": None,
-                "example": [1024, 1024]
-            },
-            "num_frames": {
-                "name": "num_frames",
-                "type": "int",
-                "default": 10,
-                "items": None,
-                "example": 20
-            }
-        },
-        "UnstructuredLoader": {
-            "strategy": {
-                "name": "strategy",
-                "type": "string",
-                "default": "hi_res",
-                "items": ["hi_res", "fast", "auto"],
-                "example": "fast"
-            },
-            "partition_via_api": {
-                "name": "partition_via_api",
-                "type": "boolean",
-                "default": False,
-                "example": True
-            }
-        }
-    }
-'''
 
+
+
+
+
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# COST‑ESTIMATE ENDPOINT – formula, params, params_conditions
+# ─────────────────────────────────────────────────────────────────────────────
+HIRES_PRICE_PER_PAGE  = float(os.getenv("HIRES_PRICE_PER_PAGE",  "0.01"))   # USD
+FAST_PRICE_PER_PAGE   = float(os.getenv("FAST_PRICE_PER_PAGE",   "0.001"))
+IMAGE_FLAT_COST_USD   = float(os.getenv("IMAGE_FLAT_COST_USD",   "0.005"))  # USD / img
+VIDEO_PRICE_PER_MIN   = float(os.getenv("VIDEO_PRICE_PER_MIN",   "0.10"))   # USD / min
+FALLBACK_KB_PER_PAGE  = 100                                                # ↳ csv / txt …
+
+IMAGE_EXT = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tif", ".tiff", ".webp"}
+VIDEO_EXT = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
+PAGE_DOCS = {".pdf", ".pptx", ".docx", ".tif", ".tiff"}                    # estendibile
+
+# ── Pydantic ────────────────────────────────────────────────────────────────
+class FileCost(BaseModel):
+    filename        : str
+    kind            : str                   # document | image | video
+    pages           : int    | None = None
+    minutes         : float  | None = None
+    strategy        : str    | None = None
+    size_bytes      : int    | None = None
+    tokens_est      : int    | None = None
+    cost_usd        : float  | None = None
+    formula         : str    | None = None
+    params          : Dict[str, Any] | None = None
+    params_conditions: Dict[str, str] | None = None   # 👈 NUOVO
+    error           : str    | None = None
+
+class CostEstimateResponse(BaseModel):
+    files       : List[FileCost]
+    grand_total : float
+
+# ── Helpers ─────────────────────────────────────────────────────────────────
+def _price_per_page(strategy: str) -> float:
+    return HIRES_PRICE_PER_PAGE if strategy == "hi_res" else FAST_PRICE_PER_PAGE
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helper: pagine documento
+# ─────────────────────────────────────────────────────────────────────────────
+def _estimate_pages(ext: str, content: bytes) -> int:
+    ext = ext.lower()
+    bio = BytesIO(content)
+
+    if ext == ".pdf":
+        return len(PdfReader(bio).pages)
+
+    elif ext == ".pptx":
+        return len(Presentation(bio).slides)
+
+    elif ext == ".docx":
+        doc = docx.Document(bio)
+        words = sum(len(p.text.split()) for p in doc.paragraphs)
+        return max(1, math.ceil(words / 800))  # 800 parole ≈ 1 pagina
+
+    elif ext in {".tif", ".tiff"}:
+        img = Image.open(bio)
+        return getattr(img, "n_frames", 1)  # multipage‑TIFF
+
+    # Fallback: 100 KB → 1 pagina (regola Unstructured)
+    return math.ceil(len(content) / 102_400)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helper: durata video in minuti (usa moviepy se disponibile, altrimenti size‑heuristic)
+# ─────────────────────────────────────────────────────────────────────────────
+def _estimate_video_minutes(tmp_path: Path) -> float:
+    try:
+        from moviepy import VideoFileClip          # lazy‑import
+        with VideoFileClip(tmp_path) as clip:
+            return clip.duration / 60.0
+    except Exception:
+        # Heuristica: 5 MB ≈ 1 minuto
+        size_mb = tmp_path.stat().st_size / (1024 * 1024)
+        return size_mb / 5.0                              # molto approssimativo
+
+# prima era:  def _choose_strategy(kwargs: dict | None) -> str:
+def _choose_strategy(
+    kwargs: dict | None,
+    ext: str,
+    size_bytes: int
+) -> str:
+    """
+    Ritorna la strategy da usare.
+    -   'hi_res' / 'fast'  → pass-through
+    -   'auto'             → heuristic “stile Unstructured”:
+            • se (kind==image) OR (size_bytes < 200 KB) → fast
+            • altrimenti                               → hi_res
+    """
+    raw = (kwargs or {}).get("strategy", "hi_res")
+
+    if raw != "auto":
+        return raw            # 'hi_res' o 'fast' espliciti
+
+    # --- heuristica per la modalità AUTO -------------------------
+    is_img = ext in IMAGE_EXT
+    if is_img or size_bytes < 200_000:        # <≈200 KB
+        return "fast"
+    return "hi_res"
+
+# ── Endpoint ────────────────────────────────────────────────────────────────
+@app.post("/estimate_file_processing_cost", response_model=CostEstimateResponse)
+async def estimate_file_processing_cost(
+    files        : List[UploadFile] = File(...),
+    #loaders      : str | None = Form(None),
+    loader_kwargs: str | None = Form(None),
+):
+    try:
+        kwargs_map  = json.loads(loader_kwargs) if loader_kwargs else {}
+    except json.JSONDecodeError as e:
+        raise HTTPException(422, f"loader_kwargs JSON non valido: {e}")
+
+    results: List[FileCost] = []
+
+    # ① prima immagini & video, poi documenti
+    ordered = sorted(
+        files,
+        key=lambda f: 0 if Path(f.filename).suffix.lower() in IMAGE_EXT
+                         or Path(f.filename).suffix.lower() in VIDEO_EXT
+                      else 1
+    )
+
+    for up in ordered:
+        ext  = Path(up.filename).suffix.lower()
+        kind = ("image" if ext in IMAGE_EXT else
+                "video" if ext in VIDEO_EXT else
+                "document")
+
+        try:
+            blob   = await up.read()
+            size_b = len(blob)
+
+            # ───── VIDEO ──────────────────────────────────────────────────
+            if kind == "video":
+                with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+                    tmp.write(blob)
+                    tmp_path = Path(tmp.name)
+
+                try:
+                    minutes = _estimate_video_minutes(tmp_path)
+                finally:
+                    tmp_path.unlink(missing_ok=True)
+
+                results.append(FileCost(
+                    filename = up.filename,
+                    kind     = kind,
+                    minutes  = round(minutes, 2),
+                    size_bytes = size_b,
+                    cost_usd = round(minutes * VIDEO_PRICE_PER_MIN, 4),
+                    formula  = "cost = {minutes} * {VIDEO_PRICE_PER_MIN}",
+                    params   = {
+                        "minutes"            : round(minutes, 2),
+                        "VIDEO_PRICE_PER_MIN": VIDEO_PRICE_PER_MIN,
+                    },
+                    params_conditions = {}          # nessuna condizione
+                ))
+                continue
+
+            # ───── IMMAGINI ───────────────────────────────────────────────
+            if kind == "image":
+                results.append(FileCost(
+                    filename   = up.filename,
+                    kind       = kind,
+                    size_bytes = size_b,
+                    cost_usd   = IMAGE_FLAT_COST_USD,
+                    formula    = "cost = {IMAGE_FLAT_COST_USD}",
+                    params     = {"IMAGE_FLAT_COST_USD": IMAGE_FLAT_COST_USD},
+                    params_conditions = {}
+                ))
+                continue
+
+            # ───── DOCUMENTI  ────────────────────────────────────────────
+            strategy = _choose_strategy(kwargs_map, ext, size_b)
+            price_page = _price_per_page(strategy)
+
+            base_params = {
+                # valori possibili *indipendenti* dalla scelta
+                "HIRES_PRICE_PER_PAGE": HIRES_PRICE_PER_PAGE,
+                "FAST_PRICE_PER_PAGE" : FAST_PRICE_PER_PAGE,
+                "strategy"            : None,
+            }
+
+            cond = {
+                "price_per_page": "{HIRES_PRICE_PER_PAGE} if {strategy}=='hi_res' "
+                                  "else {FAST_PRICE_PER_PAGE}"
+            }
+
+            if ext in PAGE_DOCS:
+                pages = _estimate_pages(ext, blob)
+                results.append(FileCost(
+                    filename   = up.filename,
+                    kind       = kind,
+                    pages      = pages,
+                    strategy   = strategy,
+                    size_bytes = size_b,
+                    tokens_est = round(min(size_b, 500_000) / 4),
+                    cost_usd   = round(pages * price_page, 4),
+                    formula    = "cost = {pages} * {price_per_page}",
+                    params     = base_params | {  # unione dizionari (3.9+)
+                        "pages"         : pages,
+                        "price_per_page": None,
+                    },
+                    params_conditions = cond,
+                ))
+            else:
+                pages_est = math.ceil(size_b / (FALLBACK_KB_PER_PAGE * 1024))
+                results.append(FileCost(
+                    filename   = up.filename,
+                    kind       = kind,
+                    pages      = pages_est,
+                    strategy   = strategy,
+                    size_bytes = size_b,
+                    cost_usd   = round(pages_est * price_page, 4),
+                    formula    = ("cost = ceil({size_bytes} / 102400) * {price_per_page}"),
+                    params     = base_params | {
+                        "size_bytes"     : size_b,
+                        #"pages_est"      : pages_est,
+                        #"KB_per_page_rule": FALLBACK_KB_PER_PAGE,
+                        "price_per_page" : None,
+                    },
+                    params_conditions = cond #| {
+                        #"pages_est": f"ceil(size_bytes / ({FALLBACK_KB_PER_PAGE} KB))"
+                    #},
+                ))
+
+        except Exception as exc:
+            results.append(FileCost(
+                filename = up.filename,
+                kind     = kind,
+                error    = str(exc),
+            ))
+
+    grand_total = round(sum(f.cost_usd or 0.0 for f in results), 4)
+    return CostEstimateResponse(files=results, grand_total=grand_total)
+
+
+
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENDPOINT: stima costo di UNA interazione con una chain/agent
+# ─────────────────────────────────────────────────────────────────────────────
+import os, math, json, httpx
+from typing import List, Dict, Any
+from fastapi import HTTPException, Body
+from pydantic import BaseModel, Field
+
+# ╭──── prezzi (override via env) ───────────────────────────────────────────╮
+GPT4O_IN_PRICE        = float(os.getenv("GPT4O_IN_PRICE",        "0.01"))   # USD / 1k tok
+GPT4O_OUT_PRICE       = float(os.getenv("GPT4O_OUT_PRICE",       "0.03"))
+GPT4O_MINI_IN_PRICE   = float(os.getenv("GPT4O_MINI_IN_PRICE",   "0.002"))
+GPT4O_MINI_OUT_PRICE  = float(os.getenv("GPT4O_MINI_OUT_PRICE",  "0.006"))
+# ╰──────────────────────────────────────────────────────────────────────────╯
+PER_TOOL_TOKEN_EST    = int(os.getenv("PER_TOOL_TOKEN_EST",      "300"))
+DEFAULT_TOOLS_COUNT   = int(os.getenv("DEFAULT_TOOLS_COUNT",     "3"))
+MAX_OUTPUT_TOKENS_DEF = int(os.getenv("MAX_OUTPUT_TOKENS",       "500"))
+
+# ── INPUT / OUTPUT models ──────────────────────────────────────────────────
+class EstimateInteractionRequest(BaseModel):
+    chain_id     : str | None = None
+    chain_config : Dict[str, Any] | None = None
+    message      : str
+    chat_history : List[List[str]] = Field(default_factory=list)
+
+class InteractionCost(BaseModel):
+    model_name      : str
+    input_tokens    : int
+    output_tokens   : int
+    total_tokens    : int
+    cost_input_usd  : float
+    cost_output_usd : float
+    cost_total_usd  : float
+    formula         : str
+    params          : Dict[str, Any]
+    params_conditions: Dict[str, str]
+
+# ── helpers ----------------------------------------------------------------
+def _tok_est(text: str) -> int:          # 1 token ≈ 4 caratteri
+    return math.ceil(len(text) / 4)
+
+def _price_for(model_name: str) -> tuple[float, float, str, str]:
+    """
+    → (price_in, price_out, cond_in_str, cond_out_str)
+    """
+    cond_in  = ("{GPT4O_MINI_IN_PRICE}  if {model_name} = 'gpt-4o-mini' "
+                "else {GPT4O_IN_PRICE}")
+    cond_out = ("{GPT4O_MINI_OUT_PRICE} if {model_name} = 'gpt-4o' "
+                "else {GPT4O_OUT_PRICE}")
+
+    if "mini" in model_name.lower():
+        return GPT4O_MINI_IN_PRICE, GPT4O_MINI_OUT_PRICE, cond_in, cond_out
+    return GPT4O_IN_PRICE, GPT4O_OUT_PRICE, cond_in, cond_out
+
+async def _get_chain_config(cfg_id: str) -> Dict[str, Any]:
+    async with httpx.AsyncClient() as c:
+        r = await c.get(f"{NLP_CORE_SERVICE}/chains/chain_config/{cfg_id}")
+    if r.status_code != 200:
+        raise HTTPException(r.status_code, f"Chain‑config '{cfg_id}' non trovata")
+    return r.json()
+
+async def _get_llm_config(llm_id: str) -> Dict[str, Any] | None:
+    cfg_id = f"{llm_id}_config" if not llm_id.endswith("_config") else llm_id
+    async with httpx.AsyncClient() as c:
+        r = await c.get(f"{NLP_CORE_SERVICE}/llms/configuration/{cfg_id}")
+    return r.json() if r.status_code == 200 else None
+
+
+# ── Endpoint ----------------------------------------------------------------
+@app.post("/estimate_chain_interaction_cost", response_model=InteractionCost)
+async def estimate_chain_interaction_cost(
+    body: EstimateInteractionRequest = Body(...)
+):
+    # 0️⃣  Recupero configurazione chain ----------------------------------------
+    if body.chain_config:
+        chain_cfg = body.chain_config
+    elif body.chain_id:
+        cfg_id   = body.chain_id if body.chain_id.endswith("_config") \
+                                else f"{body.chain_id}_config"
+        chain_cfg = await _get_chain_config(cfg_id)
+    else:
+        raise HTTPException(422, "Serve chain_id o chain_config")
+
+    # 1️⃣  Elementi principali della chain --------------------------------------
+    system_msg = chain_cfg.get("system_message", "")
+    tools      = chain_cfg.get("tools", [])
+    llm_id     = chain_cfg.get("llm_id", "")
+
+    # 2️⃣  Config LLM  →  modello & max‑tokens out ------------------------------
+    llm_cfg        = await _get_llm_config(llm_id)
+    model_name     = (
+        llm_cfg.get("model_kwargs", {}).get("model_name")
+        if llm_cfg else "gpt-4o"
+    )
+    max_out_tokens = (
+        llm_cfg.get("model_kwargs", {}).get("max_tokens", MAX_OUTPUT_TOKENS_DEF)
+        if llm_cfg else MAX_OUTPUT_TOKENS_DEF
+    )
+
+    # 3️⃣  StifetchInitialCostma token *distinta* per ogni sorgente -----------------------------
+    tokens_system   = _tok_est(system_msg)
+    tokens_user     = _tok_est(body.message)
+    tokens_history  = _tok_est(" ".join(m for _, m in body.chat_history))
+    tokens_tools    = (len(tools) or DEFAULT_TOOLS_COUNT) * PER_TOOL_TOKEN_EST
+
+    # input totale
+    input_tokens = tokens_system + tokens_user + tokens_history + tokens_tools
+    output_tokens = 500 #max_out_tokens      # ↖️ puoi cambiarlo se vuoi fisso
+
+    # 4️⃣  Prezzi & costi --------------------------------------------------------
+    price_in, price_out, cond_in, cond_out = _price_for(model_name)
+
+    cost_in  = round(input_tokens  / 1_000 * price_in , 4)
+    cost_out = round(output_tokens / 1_000 * price_out, 4)
+    total    = round(cost_in + cost_out, 4)
+
+    # 5️⃣  Formula esplicita -----------------------------------------------------
+    formula = (
+        "cost_total = (({tokens_system} + {tokens_user} + "
+        "{tokens_history} + {tokens_tools}) / 1000) * {price_in} "
+        "+ ({output_tokens} / 1000) * {price_out}"
+    )
+
+    # 6️⃣  Params dettagliati (per UI & ricalcoli locali) -----------------------
+    params = {
+        "tokens_system"  : tokens_system,
+        "tokens_user"    : tokens_user,
+        "tokens_history" : tokens_history,
+        "output_tokens"  : output_tokens,
+        "price_in"       : price_in,
+        "price_out"      : price_out,
+        "model_name"     : None,          # viene risolto lato client (params_conditions)
+    }
+
+    # 7️⃣  Condizioni per i prezzi (restano uguali) -----------------------------
+    params_conditions = {
+        "price_in" : cond_in,
+        "price_out": cond_out,
+    }
+
+    # 8️⃣  Response -------------------------------------------------------------
+    return InteractionCost(
+        model_name        = model_name,
+        input_tokens      = input_tokens,
+        output_tokens     = output_tokens,
+        total_tokens      = input_tokens + output_tokens,
+        cost_input_usd    = cost_in,
+        cost_output_usd   = cost_out,
+        cost_total_usd    = total,
+        formula           = formula,
+        params            = params,
+        params_conditions = params_conditions,
+    )
