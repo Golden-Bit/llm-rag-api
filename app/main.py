@@ -2016,7 +2016,7 @@ async def loader_kwargs_schema():
                 "name": "partition_via_api",
                 "type": "boolean",
                 "default": False,
-                "example": True
+                "example": False
             }
         }
     }
@@ -2038,10 +2038,17 @@ FAST_PRICE_PER_PAGE   = float(os.getenv("FAST_PRICE_PER_PAGE",   "0.001"))
 IMAGE_FLAT_COST_USD   = float(os.getenv("IMAGE_FLAT_COST_USD",   "0.005"))  # USD / img
 VIDEO_PRICE_PER_MIN   = float(os.getenv("VIDEO_PRICE_PER_MIN",   "0.10"))   # USD / min
 FALLBACK_KB_PER_PAGE  = 100                                                # ↳ csv / txt …
+TOKENS_PER_PAGE = 1000          # ≈ 1k‑token ≃ 4000 caratteri
 
 IMAGE_EXT = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tif", ".tiff", ".webp"}
 VIDEO_EXT = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
-PAGE_DOCS = {".pdf", ".pptx", ".docx", ".tif", ".tiff"}                    # estendibile
+PAGE_DOCS = {".pdf", ".pptx", ".docx", ".tif", ".tiff"}
+
+# --- formati testuali “puri” da cui estraiamo direttamente testo ---
+TEXT_EXT = {
+    ".txt", ".md", ".rst", ".csv", ".tsv", ".json", ".yaml", ".yml",
+    ".html", ".htm", ".xml"
+}
 
 # ── Pydantic ────────────────────────────────────────────────────────────────
 class FileCost(BaseModel):
@@ -2065,6 +2072,19 @@ class CostEstimateResponse(BaseModel):
 # ── Helpers ─────────────────────────────────────────────────────────────────
 def _price_per_page(strategy: str) -> float:
     return HIRES_PRICE_PER_PAGE if strategy == "hi_res" else FAST_PRICE_PER_PAGE
+
+def _estimate_text_pages(blob: bytes) -> int:
+    """
+    Conta i token (≈ len(text)/4) e li converte in pagine.
+    """
+    try:
+        text = blob.decode("utf-8", errors="ignore")
+    except UnicodeDecodeError:
+        text = blob.decode("latin-1", errors="ignore")
+
+    tokens = math.ceil(len(text) / 4)
+    print(text, tokens)# 1 token ≈ 4 char
+    return max(1, math.ceil(tokens / TOKENS_PER_PAGE))
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helper: pagine documento
@@ -2221,36 +2241,64 @@ async def estimate_file_processing_cost(
                     filename   = up.filename,
                     kind       = kind,
                     pages      = pages,
-                    strategy   = strategy,
+                    #strategy   = strategy,
                     size_bytes = size_b,
-                    tokens_est = round(min(size_b, 500_000) / 4),
+                    tokens_est = None, #round(min(size_b, 500_000) / 4),
                     cost_usd   = round(pages * price_page, 4),
                     formula    = "cost = {pages} * {price_per_page}",
                     params     = base_params | {  # unione dizionari (3.9+)
                         "pages"         : pages,
                         "price_per_page": None,
+                        "strategy": None
                     },
                     params_conditions = cond,
                 ))
+
+                continue
+
+            # --- Documenti TESTUALI PURI  ---------------------------------
+            elif ext in TEXT_EXT:
+                pages_est = _estimate_text_pages(blob)
+                tokens    = pages_est * TOKENS_PER_PAGE
+                results.append(FileCost(
+                    filename   = up.filename,
+                    kind       = kind,
+                    pages      = pages_est,
+                    #strategy   = strategy,
+                    size_bytes = size_b,
+                    cost_usd   = round(pages_est * price_page, 4),
+                    formula    = (
+                        "cost = {pages_est} * {price_per_page}"
+                    ),
+                    params     = base_params | {
+                        "tokens"         : tokens,
+                        "TOKENS_PER_PAGE": TOKENS_PER_PAGE,
+                        "pages_est": pages_est,
+                        "price_per_page" : None,
+                        "strategy": None,
+                    },
+                    params_conditions = cond,
+                ))
+                continue   #  <‑‑ per saltare al prossimo file
+
             else:
                 pages_est = math.ceil(size_b / (FALLBACK_KB_PER_PAGE * 1024))
                 results.append(FileCost(
                     filename   = up.filename,
                     kind       = kind,
                     pages      = pages_est,
-                    strategy   = strategy,
+                    #strategy   = strategy,
                     size_bytes = size_b,
                     cost_usd   = round(pages_est * price_page, 4),
-                    formula    = ("cost = ceil({size_bytes} / 102400) * {price_per_page}"),
+                    formula    = ("cost = ceil({size_bytes} / ({KB_per_page_rule} * 1024)) * {price_per_page}"),
                     params     = base_params | {
                         "size_bytes"     : size_b,
-                        #"pages_est"      : pages_est,
-                        #"KB_per_page_rule": FALLBACK_KB_PER_PAGE,
+                        "pages_est"      : pages_est,
+                        "KB_per_page_rule": FALLBACK_KB_PER_PAGE,
                         "price_per_page" : None,
+                        "strategy": None
                     },
-                    params_conditions = cond #| {
-                        #"pages_est": f"ceil(size_bytes / ({FALLBACK_KB_PER_PAGE} KB))"
-                    #},
+                    params_conditions = cond
                 ))
 
         except Exception as exc:
