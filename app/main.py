@@ -896,6 +896,8 @@ class UpdateFileMetadataRequest(BaseModel):
 @app.post("/contexts", response_model=ContextMetadata)
 async def create_context(request: CreateContextRequest):
 
+    print(request.model_dump_json(indent=2))
+
     if REQUIRED_AUTH:
         verify_access_token(request.token, cognito_sdk)
 
@@ -950,6 +952,12 @@ async def list_contexts(request: ListContextsRequest):
         )
         for ctx in all_contexts
     ]
+
+    for ctx in all_contexts:
+
+        if "display_name" not in ctx["custom_metadata"]:
+            print(ctx)
+            print('#'*120)
 
     if not user_contexts:
         raise HTTPException(status_code=403, detail="Non sei autorizzato a visualizzare questi contesti.")
@@ -1388,6 +1396,7 @@ async def _ensure_vs_exists(
     • altrimenti lo configura e poi lo carica
     → ritorna sempre lo **store_id** da usare negli strumenti.
     """
+
     base_cfg = _build_vs_base_cfg(ctx, api_key)
     cfg_id, store_id = make_vector_store_ids(base_cfg)
 
@@ -1399,12 +1408,14 @@ async def _ensure_vs_exists(
         json=vs_cfg,
     )
     if resp.status_code not in (200, 400):
+
         raise HTTPException(resp.status_code, resp.text)
 
     # 2. load in RAM  (200 = ok, 400 = già in RAM)
     resp = await client.post(
         f"{NLP_CORE_SERVICE}/vector_stores/vector_store/load/{cfg_id}"
     )
+
     if resp.status_code not in (200, 400):
         raise HTTPException(resp.status_code, resp.text)
 
@@ -1420,6 +1431,8 @@ async def configure_and_load_chain(
     """
     Configura e carica una chain in memoria basata sul contesto dato.
     """
+
+    print(input_data.model_dump_json(indent=2))
 
     if REQUIRED_AUTH:
         verify_access_token(input_data.token, cognito_sdk)
@@ -1451,11 +1464,13 @@ async def configure_and_load_chain(
         # configure_model (potrebbe già esistere → 400 = OK)
         cfg_resp = await client.post(f"{NLP_CORE_SERVICE}/llms/configure_model/", json=llm_payload)
         if cfg_resp.status_code not in (200, 400):
+
             raise HTTPException(cfg_resp.status_code, cfg_resp.text)
 
         # load_model (potrebbe già essere in RAM → 400 = OK)
         llm_load_result = await client.post(f"{NLP_CORE_SERVICE}/llms/load_model/{llm_config_id}")
         if llm_load_result.status_code not in (200, 400):
+
             raise HTTPException(llm_load_result.status_code, llm_load_result.text)
 
     llm_load_result = llm_load_result.json()
@@ -1494,7 +1509,10 @@ async def configure_and_load_chain(
     # --- Nuovo: recupera metadata e file per ciascun context ---
     contexts_data = []
 
+
+
     for ctx in contexts:
+        print(ctx)
         # metadata del context
         ctx_meta = await get_context_info(ctx, input_data.token)
         # file associati al context
@@ -1582,7 +1600,8 @@ async def configure_and_load_chain(
         "llm_id": llm_id,  # Usa l'ID del modello LLM configurato
         "tools": tools,
         "extra_metadata": {
-            "contexts": contexts
+            "contexts": contexts,
+            "model_name": model_name
     }
     }
 
@@ -2533,6 +2552,7 @@ async def get_chain_configuration(body: GetChainConfigurationRequest):
     # 1) se presente in extra_metadata
     extra_meta = cfg.get("extra_metadata") or {}
     contexts = extra_meta.get("contexts")
+    model_name = extra_meta.get("model_name")
 
     # 2) fallback: deducilo dai VectorStoreTools (store_id ➜ potrebbe essere hash)
     if contexts is None:
