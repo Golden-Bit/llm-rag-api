@@ -98,6 +98,22 @@ class FileUploadResponse(BaseModel):
     contexts: List[str]
     tasks: Optional[Any]=None
 
+# --- aggiungi vicino agli altri BaseModel ---------------------------
+class GetChainConfigurationRequest(BaseModel):
+    chain_id: str | None = Field(
+        default=None,
+        description="ID della chain (senza _config). Se presente ha precedenza su chain_config_id."
+    )
+    chain_config_id: str | None = Field(
+        default=None,
+        description="ID della configurazione della chain (termina con _config)."
+    )
+    token: str | None = Field(
+        default=None,
+        description="Access token (richiesto solo se REQUIRED_AUTH=True)."
+    )
+
+
 # ------------------------------------------------------------------
 # NUOVO: descrive la configurazione di un LLM ChatOpenAI
 # ------------------------------------------------------------------
@@ -1564,7 +1580,10 @@ async def configure_and_load_chain(
         "chain_id": f"{id_}", #_agent_with_tools",
         "system_message": system_message, # #SYSTEM_MESSAGE,
         "llm_id": llm_id,  # Usa l'ID del modello LLM configurato
-        "tools": tools
+        "tools": tools,
+        "extra_metadata": {
+            "contexts": contexts
+    }
     }
 
     async with httpx.AsyncClient() as client:
@@ -2469,3 +2488,59 @@ async def estimate_chain_interaction_cost(
         params            = params,
         params_conditions = params_conditions,
     )
+
+
+@app.post("/get_chain_configuration", response_model=Dict[str, Any])
+async def get_chain_configuration(body: GetChainConfigurationRequest):
+    """
+    Restituisce la configurazione di una chain e garantisce
+    che il campo `contexts` sia presente (ricavato da extra_metadata
+    o – in fallback – dai VectorStoreTools).
+    """
+    # ── autenticazione (se serve) ──────────────────────────────────────────
+    if REQUIRED_AUTH:
+        verify_access_token(body.token, cognito_sdk)
+
+    # ── quale config_id devo chiedere? ------------------------------------
+    if body.chain_id:
+        config_id = (
+            body.chain_id if body.chain_id.endswith("_config")
+            else f"{body.chain_id}_config"
+        )
+    elif body.chain_config_id:
+        config_id = (
+            body.chain_config_id if body.chain_config_id.endswith("_config")
+            else f"{body.chain_config_id}_config"
+        )
+    else:
+        raise HTTPException(422, "Devi fornire chain_id oppure chain_config_id")
+
+    # ── chiamata upstream ---------------------------------------------------
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(f"{NLP_CORE_SERVICE}/chains/chain_config/{config_id}")
+
+    if resp.status_code != 200:
+        # propaghiamo l'errore originale
+        try:
+            detail = resp.json()
+        except Exception:
+            detail = resp.text
+        raise HTTPException(resp.status_code, detail)
+
+    cfg = resp.json()
+
+    # ── normalizziamo il nuovo campo `contexts` -----------------------------
+    # 1) se presente in extra_metadata
+    extra_meta = cfg.get("extra_metadata") or {}
+    contexts = extra_meta.get("contexts")
+
+    # 2) fallback: deducilo dai VectorStoreTools (store_id ➜ potrebbe essere hash)
+    if contexts is None:
+        contexts = [
+            t["kwargs"]["store_id"]
+            for t in cfg.get("tools", [])
+            if t.get("name") == "VectorStoreTools"
+        ]
+
+    cfg["contexts"] = contexts
+    return cfg
