@@ -1072,12 +1072,6 @@ async def upload_file_to_multiple_contexts_async(
     if REQUIRED_AUTH:
         verify_access_token(token, cognito_sdk)
 
-    print("#" * 120)
-    print(json.dumps(loaders, indent=2))
-    print("#"*120)
-    print(json.dumps(loader_kwargs, indent=2))
-    print("#" * 120)
-
     ####################################################################################################################
     # TODO:
     #  - verifica se in path è presente prefisso, altrimenti aggiungi (dovremo richiedere anche username in input)
@@ -1377,16 +1371,12 @@ class ConfigureAndLoadChainInput(BaseModel):
     llm: Optional[LLMConfig] = None
     model_name: Optional[str] = "gpt-4o"  # Nome del modello, default "gpt-4o-mini"
     system_message: Optional[str] = "You are an helpful assistant."
-    system_message_content: Optional[str] = Field(
-        default = None,
-        description = "Se fornito, verrà aggiunto in coda al sistema di default sotto una sezione 'Additional Instructions'.")
-    custom_server_tools: List[Dict[str, Any]] = Field(
-        default_factory = list,
-        description = 'Lista di tool ({"name":..., "kwargs":{...}}) da aggiungere o con cui sovrascrivere quelli di default.')
-    client_tool_specs : List[ToolSpec] = Field(
+
+    tool_specs     : List[ToolSpec] = Field(
         default_factory=list,
         description="Elenco facoltativo di tool/widget da documentare"
     )
+
     token: Optional[str] = None
 
 # -----------------------------------------------------------------------------
@@ -1457,7 +1447,7 @@ async def configure_and_load_chain(
 
 
 
-    client_tool_specs = [t.build_widget_instructions() for t in input_data.client_tool_specs]
+    client_tool_specs = [t.build_widget_instructions() for t in input_data.tool_specs]
 
 
 
@@ -1562,17 +1552,6 @@ async def configure_and_load_chain(
     {json.dumps(contexts_data, indent=4).replace('{', '{{').replace('}', '}}')}
     -----------------------------------------------------------------------------------------------------
     """
-
-    # ── Se ho del testo extra da appendere, lo aggiungo in coda ──────────────
-
-    if input_data.system_message_content:
-        system_message += (
-            "\n\n## ADDITIONAL INSTRUCTIONS\n"
-            "-----------------------------------------------------------------------------------------------------"
-            f"{input_data.system_message_content}"
-            "-----------------------------------------------------------------------------------------------------"
-        )
-
     ####################################################################################################################
 
     # vector_store_config_id = f"{context}_vector_store_config"
@@ -1619,22 +1598,14 @@ async def configure_and_load_chain(
 
     # vectorstore_ids = [vector_store_id]
 
-    default_tools = [{"name": "VectorStoreTools", "kwargs": {"store_id": vectorstore_id}} for vectorstore_id in vectorstore_ids]
+    tools = [{"name": "VectorStoreTools", "kwargs": {"store_id": vectorstore_id}} for vectorstore_id in vectorstore_ids]
 
-    default_tools.append({"name": "MongoDBTools",
+    tools.append({"name": "MongoDBTools",
                   "kwargs": {
                       "connection_string": "mongodb://localhost:27017",
                       "default_database": f"default_db",
                       "default_collection": "default_collection"
                   }})
-
-    # ── Applico le custom_tools: sovrascrivo o aggiungo ────────────────────
-    tools_by_name = {t["name"]: t for t in default_tools}
-
-    for ct in input_data.custom_server_tools:
-        tools_by_name[ct["name"]] = ct
-    tools = list(tools_by_name.values())
-
 
     # Configurazione della chain
     chain_config = {
@@ -1646,10 +1617,7 @@ async def configure_and_load_chain(
         "tools": tools,
         "extra_metadata": {
             "contexts": contexts,
-            "model_name": model_name,
-            "system_message_content": input_data.system_message_content,
-            "custom_server_tools": input_data.custom_server_tools,
-            #"client_tool_specs":  input_data.client_tool_specs
+            "model_name": model_name
     }
     }
 
@@ -2173,74 +2141,20 @@ async def loader_kwargs_schema():
             }
         },
         "UnstructuredLoader": {
-  "mode": {
-    "name": "mode",
-    "type": "string",
-    "default": "single",
-    "items": ["single", "elements"],
-    "example": "elements",
-    #"description": "– “single”: ritorna un unico Document con tutto il contenuto.  \n– “elements”: un Document per ogni elemento estratto (paragrafi, titoli, immagini, PageBreak…)."
-  },
-  "chunking_strategy": {
-    "name": "chunking_strategy",
-    "type": "string",
-    "default": "basic",
-    "items": ["basic", "by_title"], #, "by_page", "by_similarity"],
-    "example": "basic",
-    #"description": "Strategia di suddivisione in chunk:  \n– basic: fill fino ai limiti di caratteri  \n– by_title: split su ogni Title  \n– by_page: un chunk = una pagina (tramite API)  \n– by_similarity: group topic‑wise (tramite API)"
-  },
             "strategy": {
                 "name": "strategy",
                 "type": "string",
-                "default": "auto",
-                "items": ["auto", "fast", "hi_res", "ocr_only"],
-                "example": "fast",
-                #"description": "Modalità di parsing per PDF/immagini: “fast” per velocità, “hi_res” per layout di precisione, “ocr_only” per solo OCR."
+                "default": "hi_res",
+                "items": ["hi_res", "fast", "auto"],
+                "example": "fast"
             },
-  "max_characters": {
-    "name": "max_characters",
-    "type": "integer",
-    "default": 500,
-    "example": 1500,
-    #"description": "Hard cap sul numero massimo di caratteri per chunk."
-  },
-  "new_after_n_chars": {
-    "name": "new_after_n_chars",
-    "type": "integer",
-    "default": 500,
-    "example": 1000,
-    #"description": "Soft cap: suggerisce il punto di break, fino a un massimo di max_characters."
-  },
-  "overlap": {
-    "name": "overlap",
-    "type": "integer",
-    "default": 0,
-    "example": 200,
-    #"description": "Numero di caratteri ripresi all’inizio di ogni nuovo chunk."
-  },
-  "overlap_all": {
-    "name": "overlap_all",
-    "type": "boolean",
-    "default": False,
-    "example": False,
-    #"description": "Se true applica overlap anche fra chunk che non superano max_characters."
-  },
-  "include_page_breaks": {
-    "name": "include_page_breaks",
-    "type": "boolean",
-    "default": False,
-    "example": True,
-    #"description": "Inietta elementi PageBreak nei risultati per mantenere i confini di pagina."
-  },
             "partition_via_api": {
                 "name": "partition_via_api",
                 "type": "boolean",
                 "default": False,
-                "example": False,
-                #"description": "Se true forza l’uso del Partition Endpoint remoto invece del parsing locale."
-            },
-}
-
+                "example": False
+            }
+        }
     }
 
 
