@@ -21,10 +21,31 @@ from PIL import Image, TiffImagePlugin
 import tempfile
 import os, math, json
 import httpx
+from typing import Literal, Optional, Dict, Any, Union, Annotated
+from pydantic import BaseModel, Field
 from app.auth_sdk.sdk import CognitoSDK, AccessTokenRequest
+from app.payments_sdk.sdk import (
+    ApiError,
+    MePlansClient,
+    DynamicCheckoutRequest,
+    PortalSessionRequest,          # <-- nuovo
+    PortalConfigSelector,
+    PortalUpdateDeepLinkRequest,
+    PortalCancelDeepLinkRequest,
+    PortalUpgradeDeepLinkRequest,  # <-- nuovo
+    RawDiscountSpec,               # <-- nuovo
+    ResourcesState,
+    DynamicResource,
+)
+from pydantic import BaseModel, Field, model_validator
 from app.system_messages.client_tools_utilities import ToolSpec
 from app.system_messages.system_message_1 import get_system_message
-
+from app.utils.payments_utils import (_mk_plans_client, _find_current_subscription_id, _sdk, PLANS_SUCCESS_URL_DEF, \
+                                      PLANS_CANCEL_URL_DEF, _variant_to_portal_preset, VARIANTS_BUCKET, RETURN_URL,
+                                      _dataclass_to_dict,
+                                      build_variants_for_intent, ChangeIntent, features_for_update, _sorted_variants,
+                                      _variant_value, _cfg_key, _config_cache_get, _config_cache_put, _price_cache_put,
+                                      _price_cache_get)
 app = FastAPI(
     root_path="/llm-rag"
 )
@@ -2916,3 +2937,657 @@ async def image_to_base64(
         # Log di debug lato server, ma maschera il messaggio verso il client
         print(f"[image_to_base64] errore non gestito: {exc}")
         raise HTTPException(500, "Errore interno in image_to_base64")
+
+
+
+# --- [NEW] Schemi input/output endpoint Payments ----------------------------
+class CurrentPlanResponse(BaseModel):
+    subscription_id: str
+    status: str | None = None
+    plan_type: str | None = None
+    variant: str | None = None
+    pricing_method: str | None = None
+    active_price_id: str | None = None
+    period_start: int | None = None
+    period_end: int | None = None
+
+class CheckoutVariantIn(BaseModel):
+    token: str | None = None
+    plan_type: str
+    variant: str
+    locale: str | None = "it"
+    success_url: str | None = None
+    cancel_url: str | None = None
+
+# --- [NEW] hint dal client per evitare round-trip di stato -------------------
+class DeeplinkUpgradeIn(BaseModel):
+    token: Optional[str] = None
+    return_url: Optional[str] = None
+
+    # target: EITHER target_price_id OR (target_plan_type + target_variant)
+    target_price_id: Optional[str] = None
+    target_plan_type: Optional[str] = None
+    target_variant: Optional[str] = None
+
+    # Hints per saltare letture
+    current_subscription_id: Optional[str] = None
+    current_plan_type: Optional[str] = None
+    current_variant: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _validate_target(self):
+        if not self.target_price_id and not (self.target_plan_type and self.target_variant):
+            raise ValueError("Devi fornire target_price_id oppure target_plan_type + target_variant.")
+        return self
+
+
+class PortalSessionIn(BaseModel):
+    token: Optional[str] = None
+    return_url: Optional[str] = None
+    # hint
+    current_subscription_id: Optional[str] = None
+    current_plan_type: Optional[str] = None
+
+
+class DeeplinkUpdateIn(BaseModel):
+    token: Optional[str] = None
+    return_url: Optional[str] = None
+    change_intent: Optional[ChangeIntent] = Field(default=ChangeIntent.both)
+    variants_override: Optional[List[str]] = None
+    variants_catalog: Optional[List[str]] = None
+    # hint
+    current_subscription_id: Optional[str] = None
+    current_plan_type: Optional[str] = None
+    current_variant: Optional[str] = None
+
+
+class DeeplinkCancelIn(BaseModel):
+    token: Optional[str] = None
+    return_url: Optional[str] = None
+    immediate: bool = True
+    # facoltativo: utile solo se il backend richiede anche un preset
+    portal_preset: Optional[str] = None
+    # per soddisfare il requisito server "portal_preset o variants_override"
+    variants_catalog: Optional[List[str]] = None
+
+class CheckoutSuccess(BaseModel):
+    status: Literal["checkout"]
+    checkout_session_id: str
+    url: str
+    customer_id: Optional[str] = None
+    created_product_id: Optional[str] = None
+    created_price_id: Optional[str] = None
+
+class PortalRedirect(BaseModel):
+    status: Literal["portal_redirect"]
+    reason_code: str
+    message: str
+    portal_url: str
+    subscription_id: str
+    configuration_id: str
+
+CheckoutOrPortal = Annotated[Union[CheckoutSuccess, PortalRedirect], Field(discriminator="status")]
+
+
+# --- [NEW] GET /payments/current_plan ---------------------------------------
+@app.get("/payments/current_plan", response_model=CurrentPlanResponse)
+async def get_current_plan(
+    token: str | None = Query(None, description="Access token dell'utente"),
+):
+    if REQUIRED_AUTH:
+        verify_access_token(token, cognito_sdk)
+
+    client = _mk_plans_client(token)
+
+    sub_id = await _find_current_subscription_id(client)
+    if not sub_id:
+        raise HTTPException(404, "Nessuna subscription attiva trovata")
+
+    # Prendo lo stato risorse per ottenere plan/variant/pricing_method/periodi
+    state: ResourcesState = await _sdk(client.get_subscription_resources, sub_id)
+
+    # opzionale: leggo anche la subscription grezza per lo status
+    sub = await _sdk(client.get_subscription, sub_id)
+    status = (sub or {}).get("status")
+
+    return CurrentPlanResponse(
+        subscription_id=sub_id,
+        status=status,
+        plan_type=state.plan_type,
+        variant=state.variant,
+        pricing_method=state.pricing_method,
+        active_price_id=state.active_price_id,
+        period_start=state.period_start,
+        period_end=state.period_end,
+    )
+
+
+# --- [NEW] GET /payments/credits --------------------------------------------
+# --- [REWRITE] GET /payments/credits  ---------------------------------------
+@app.get("/payments/credits", response_model=Dict[str, Any])
+async def get_user_credits(
+    token: str | None = Query(None, description="Access token dell'utente"),
+    subscription_id: str | None = Query(None, description="Se non fornito, uso la subscription viva"),
+):
+    if REQUIRED_AUTH:
+        verify_access_token(token, cognito_sdk)
+
+    client = _mk_plans_client(token)
+
+    sub_id = subscription_id or await _find_current_subscription_id(client)
+    if not sub_id:
+        raise HTTPException(404, "Nessuna subscription attiva trovata")
+
+    # Legge lo stato risorse via SDK
+    state: ResourcesState = await _sdk(client.get_subscription_resources, sub_id)
+
+    # Normalizza ad un dict (funzione già presente nel tuo codice)
+    data = _dataclass_to_dict(state) if hasattr(state, "__dataclass_fields__") else (
+        getattr(state, "raw", None) or state
+    )
+
+    resources = (data.get("resources") or {})
+    provided_list  = resources.get("provided")  or []
+    used_list      = resources.get("used")      or []
+    remaining_list = resources.get("remaining") or []
+
+    def _sum_credits(items) -> float:
+        total = 0.0
+        for it in items:
+            # supporta sia dict sia eventuali oggetti con attributi
+            key = (it.get("key") if isinstance(it, dict) else getattr(it, "key", None)) or ""
+            if key.lower() != "credits":
+                continue
+            qty = (it.get("quantity") if isinstance(it, dict) else getattr(it, "quantity", 0)) or 0
+            try:
+                total += float(qty)
+            except Exception:
+                pass
+        return total
+
+    provided  = _sum_credits(provided_list)
+    used      = _sum_credits(used_list)
+    remaining = _sum_credits(remaining_list)
+
+    # formato pulito: solo i totali dei crediti
+    def _fmt(x: float):
+        try:
+            return int(x) if float(x).is_integer() else round(float(x), 4)
+        except Exception:
+            return x
+
+    return {
+        "provided_total":  _fmt(provided),
+        "used_total":      _fmt(used),
+        "remaining_total": _fmt(remaining),
+    }
+
+
+# --- [UPDATED] POST /payments/checkout --------------------------------------
+@app.post("/payments/checkout", response_model=CheckoutOrPortal)  # oppure Dict[str, Any]
+async def create_checkout_session_variant(body: CheckoutVariantIn):
+    """
+    Genera una Checkout Session per VARIANTE di catalogo usando lo SDK.
+
+    Ottimizzazioni L2:
+      - riuso della Billing Portal configuration via cache (configuration_id),
+        così L1 evita di risolvere/creare la configuration su Stripe;
+      - popolamento della price-cache (plan_type, variant) -> created_price_id
+        per accelerare futuri deeplink di upgrade/downgrade.
+
+    Se il server risponde 409 single_subscription_portal_redirect,
+    ritorna un payload 'portal_redirect' con l'URL del Billing Portal.
+    """
+    if REQUIRED_AUTH:
+        verify_access_token(body.token, cognito_sdk)
+
+    client = _mk_plans_client(body.token)
+
+    # Blocchi usati sia per la UI del Portal che per il fingerprint della config
+    plan_type = body.plan_type
+    variants_override = VARIANTS_BUCKET
+    features = {
+        "payment_method_update": {"enabled": True},
+        "subscription_update": {
+            "enabled": True,
+            "default_allowed_updates": ["price"],
+            "proration_behavior": "none",
+        },
+        "subscription_cancel": {"enabled": True, "mode": "immediately"},
+    }
+    headline = f"{plan_type} – Manage plan"
+
+    # [NEW] tenta riuso configuration_id dal cache L2
+    cfg_key = _cfg_key(plan_type, variants_override, features, headline)
+    cached_cfg = _config_cache_get(cfg_key)
+
+    # Costruisci il blocco 'portal' per la richiesta
+    if cached_cfg:
+        portal_block = {"configuration_id": cached_cfg}
+    else:
+        portal_block = {
+            "plan_type": plan_type,
+            "variants_override": variants_override,
+            "features_override": features,
+            "business_profile_override": {"headline": headline},
+        }
+
+    req = DynamicCheckoutRequest(
+        success_url=(body.success_url or PLANS_SUCCESS_URL_DEF),
+        cancel_url=(body.cancel_url or PLANS_CANCEL_URL_DEF),
+        plan_type=body.plan_type,
+        variant=body.variant,
+        locale=body.locale,
+        portal=portal_block,
+    )
+
+    try:
+        out = await _sdk(client.create_checkout, req)
+
+        # [NEW] se L1 ha restituito la configuration_id e non era in cache, salvala
+        try:
+            if not cached_cfg and getattr(out, "configuration_id", None):
+                _config_cache_put(cfg_key, out.configuration_id)
+        except Exception:
+            pass
+
+        # [NEW] popola la price cache per (plan_type, variant) -> created_price_id
+        try:
+            if body.plan_type and body.variant and getattr(out, "created_price_id", None):
+                _price_cache_put(body.plan_type, body.variant, out.created_price_id)
+        except Exception:
+            pass
+
+        return CheckoutSuccess(
+            status="checkout",
+            checkout_session_id=out.id,
+            url=out.url,
+            customer_id=out.customer_id,
+            created_product_id=out.created_product_id,
+            created_price_id=out.created_price_id,
+        )
+
+    except ApiError as e:
+        # Gestione specifica del redirect al Billing Portal
+        if e.status_code == 409 and isinstance(e.payload, dict):
+            detail = (e.payload.get("detail") or {}) if isinstance(e.payload, dict) else {}
+            if detail.get("code") == "single_subscription_portal_redirect":
+                return PortalRedirect(
+                    status="portal_redirect",
+                    reason_code=detail.get("code", "single_subscription_portal_redirect"),
+                    message=detail.get("message", "Aggiorna il piano esistente dal Billing Portal."),
+                    portal_url=detail.get("portal_url"),
+                    subscription_id=detail.get("subscription_id"),
+                    configuration_id=detail.get("configuration_id"),
+                )
+        # Altri errori → propaghiamo come HTTPException FastAPI
+        raise HTTPException(status_code=getattr(e, "status_code", 500), detail=getattr(e, "payload", str(e)))
+
+@app.post("/payments/portal_session", response_model=Dict[str, Any])
+async def create_portal_session(body: PortalSessionIn):
+    # 1) Autenticazione
+    if REQUIRED_AUTH:
+        verify_access_token(body.token, cognito_sdk)
+
+    client = _mk_plans_client(body.token)
+
+    # 2) Stato corrente (usa hint se presente per evitare chiamate superflue)
+    sub_id = getattr(body, "current_subscription_id", None) or await _find_current_subscription_id(client)
+    if not sub_id:
+        raise HTTPException(404, "Nessuna subscription attiva trovata")
+
+    plan_type = getattr(body, "current_plan_type", None)
+    if not plan_type:
+        state = await _sdk(client.get_subscription_resources, sub_id)
+        plan_type = getattr(state, "plan_type", None) or (state.raw.get("plan_type") if hasattr(state, "raw") else None)
+        if not plan_type:
+            raise HTTPException(409, "Impossibile dedurre il plan_type dalla subscription corrente")
+
+    # 3) Blocchi deterministici per fingerprint/config cache
+    variants_override = VARIANTS_BUCKET
+    features = {
+        "payment_method_update": {"enabled": True},
+        "subscription_update": {"enabled": False},
+        "subscription_cancel": {"enabled": True, "mode": "at_period_end"},
+        "invoice_history": {"enabled": True},
+    }
+    headline = f"{plan_type} – Manage billing"
+
+    # 4) Prova riuso configuration_id da cache L2 (fast-path: zero chiamate Stripe in L1)
+    cfg_key = _cfg_key(plan_type, variants_override, features, headline)
+    cached_cfg_id = _config_cache_get(cfg_key)
+
+    if cached_cfg_id:
+        # Se abbiamo una configuration in cache, usiamo direttamente l'ID
+        req = PortalSessionRequest(
+            return_url=(body.return_url or RETURN_URL or PLANS_SUCCESS_URL_DEF),
+            portal=PortalConfigSelector(configuration_id=cached_cfg_id),
+            flow_data=None,
+        )
+    else:
+        # Fallback: lascia che L1 risolva/crei la configuration
+        req = PortalSessionRequest(
+            return_url=(body.return_url or RETURN_URL or PLANS_SUCCESS_URL_DEF),
+            portal=PortalConfigSelector(
+                plan_type=plan_type,
+                variants_override=variants_override,
+                features_override=features,
+                business_profile_override={"headline": headline},
+            ),
+            flow_data=None,
+        )
+
+    # 5) Crea la session del Billing Portal tramite L1 e aggiorna la cache se serve
+    try:
+        sess = await _sdk(client.create_portal_session, req)
+
+        # Se abbiamo usato il fallback e L1 ci ha restituito una configuration, salvala in cache
+        if not cached_cfg_id and getattr(sess, "configuration_id", None):
+            try:
+                _config_cache_put(cfg_key, sess.configuration_id)
+            except Exception:
+                # la cache non deve mai rompere il flusso
+                pass
+
+        return {
+            "portal_session_id": sess.id,
+            "url": sess.url,
+            "configuration_id": sess.configuration_id,
+        }
+    except ApiError as e:
+        raise HTTPException(
+            status_code=getattr(e, "status_code", 500),
+            detail=getattr(e, "payload", str(e)),
+        )
+
+# -----------------------------------------------------------------------------
+# --- [FIX/OPTIMIZED] POST /payments/deeplink/update --------------------------
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# --- [FIX/OPTIMIZED] POST /payments/deeplink/update --------------------------
+# -----------------------------------------------------------------------------
+@app.post("/payments/deeplink/update", response_model=Dict[str, Any])
+async def create_update_deeplink(body: DeeplinkUpdateIn):
+    """
+    Crea un deeplink "update" al Billing Portal con:
+      - filtro varianti coerente con l'intent (upgrade/downgrade/both/none)
+      - features impostate in base all'intent
+    Ottimizzazioni L2:
+      - Hints opzionali dal client (current_subscription_id/plan_type/variant) per evitare round-trip iniziali.
+      - Config cache: se troviamo una configuration_id compatibile, la riusiamo inviandola direttamente a L1.
+        -> Fast-path in L1, zero round-trip Stripe per la risoluzione della Portal Configuration.
+    """
+    if REQUIRED_AUTH:
+        verify_access_token(body.token, cognito_sdk)
+
+    client = _mk_plans_client(body.token)
+
+    # [HINT] subscription viva (salta list_subscriptions se il client la conosce)
+    sub_id = getattr(body, "current_subscription_id", None) or await _find_current_subscription_id(client)
+    if not sub_id:
+        raise HTTPException(404, "Nessuna subscription attiva trovata")
+
+    # [HINT] plan_type/variant (salta get_subscription_resources se il client li conosce)
+    plan_type = getattr(body, "current_plan_type", None)
+    variant   = getattr(body, "current_variant", None)
+
+    if not plan_type or not variant:
+        state = await _sdk(client.get_subscription_resources, sub_id)
+        if not plan_type:
+            plan_type = getattr(state, "plan_type", None) or (state.raw.get("plan_type") if hasattr(state, "raw") else None)
+        if variant is None:
+            variant = getattr(state, "variant", None) or (state.raw.get("variant") if hasattr(state, "raw") else None)
+
+    if not plan_type:
+        raise HTTPException(409, "Impossibile dedurre il plan_type dalla subscription corrente")
+
+    # ▼ Catalogo base → filtro per intent
+    base_catalog = body.variants_catalog or VARIANTS_BUCKET
+    base_filtered = build_variants_for_intent(
+        current_variant=variant,
+        intent=body.change_intent,
+        catalog=base_catalog,
+    )
+
+    # Se il client ha passato una override, la riconfiniamo comunque all'intent
+    effective_override = body.variants_override or base_filtered
+    effective_override = build_variants_for_intent(
+        current_variant=variant,
+        intent=body.change_intent,
+        catalog=effective_override,
+    )
+
+    # Features in base all'intent (upgrade: proration immediata; downgrade: a fine periodo; both: create_prorations)
+    feat = features_for_update(body.change_intent)
+
+    # Headline del Portal
+    headline = f"{plan_type} – Update plan"
+
+    # [CACHE] prova a riusare una configuration_id già compatibile
+    cfg_key = _cfg_key(plan_type, effective_override, feat, headline)
+    cached_cfg_id = _config_cache_get(cfg_key)
+
+    # Costruisci il blocco portal:
+    #   - se c'è cache → usa direttamente configuration_id (fast-path L1)
+    #   - altrimenti → passa selector completo e cacha alla risposta
+    if cached_cfg_id:
+        portal_block: Dict[str, Any] = {"configuration_id": cached_cfg_id}
+    else:
+        portal_block = {
+            "plan_type": plan_type,
+            "variants_override": effective_override,
+            "features_override": feat,
+            "business_profile_override": {"headline": headline},
+        }
+
+    # Richiesta a L1 (schema SDK invariato)
+    req = PortalUpdateDeepLinkRequest(
+        return_url=(body.return_url or RETURN_URL or PLANS_SUCCESS_URL_DEF),
+        subscription_id=sub_id,
+        portal=portal_block,  # dict compatibile con lo SDK (selector/override lato backend)
+    )
+
+    try:
+        dl = await _sdk(client.create_deeplink_update, req)
+
+        # [CACHE] se non avevamo cache e L1 ci restituisce la configuration_id, salviamola
+        try:
+            if not cached_cfg_id and getattr(dl, "configuration_id", None):
+                _config_cache_put(cfg_key, dl.configuration_id)
+        except Exception:
+            # cache best-effort: non bloccare il flusso anche se fallisce
+            pass
+
+        return {"deeplink_id": dl.id, "url": dl.url, "configuration_id": dl.configuration_id}
+
+    except ApiError as e:
+        # Propaga come HTTPException FastAPI con payload originale
+        raise HTTPException(status_code=getattr(e, "status_code", 500), detail=getattr(e, "payload", str(e)))
+
+
+@app.post("/payments/deeplink/upgrade", response_model=Dict[str, Any])
+async def create_upgrade_deeplink(body: DeeplinkUpgradeIn):
+    if REQUIRED_AUTH:
+        verify_access_token(body.token, cognito_sdk)
+
+    client = _mk_plans_client(body.token)
+
+    # 1) Subscription viva (usa hint se presenti per evitare round-trip)
+    hinted_sub_id = getattr(body, "current_subscription_id", None)
+    sub_id = hinted_sub_id or await _find_current_subscription_id(client)
+    if not sub_id:
+        raise HTTPException(404, "Nessuna subscription attiva trovata")
+
+    # 2) Stato corrente (usa hint se presenti)
+    current_plan_type = getattr(body, "current_plan_type", None)
+    current_variant   = getattr(body, "current_variant", None)
+    if not current_plan_type or not current_variant:
+        state = await _sdk(client.get_subscription_resources, sub_id)
+        current_plan_type = current_plan_type or getattr(state, "plan_type", None) or (state.raw.get("plan_type") if hasattr(state, "raw") else None)
+        current_variant   = current_variant   or getattr(state, "variant",   None) or (state.raw.get("variant")    if hasattr(state, "raw") else None)
+    if not current_plan_type:
+        raise HTTPException(409, "Impossibile dedurre il plan_type dalla subscription corrente")
+
+    # 3) Catalogo per la Portal Configuration: limitiamo a "current + target" se noto
+    base_catalog   = VARIANTS_BUCKET
+    target_variant = body.target_variant
+    if target_variant and current_variant:
+        variants_override = _sorted_variants([v for v in base_catalog if v in {current_variant, target_variant}])
+    else:
+        # Se non conosco la variant target (es. arrivo da target_price_id), mostro comunque current + bucket
+        variants_override = _sorted_variants([current_variant] + base_catalog) if current_variant else base_catalog
+
+    # 4) Rilevazione automatica upgrade vs downgrade (se conosco entrambe le varianti)
+    #    - upgrade:   target_value > current_value
+    #    - downgrade: target_value < current_value
+    #    - altrimenti default a "upgrade"
+    is_upgrade = True
+    if current_variant and target_variant:
+        is_upgrade = _variant_value(target_variant) > _variant_value(current_variant)
+
+    # 5) Features del Portal a corredo del deeplink confermato
+    features = {
+        "payment_method_update": {"enabled": True},
+        "subscription_update": {
+            "enabled": True,
+            "default_allowed_updates": ["price"],
+            "proration_behavior": "always_invoice" if is_upgrade else "none",
+        },
+        "subscription_cancel": {"enabled": True, "mode": "at_period_end"},
+    }
+
+    # 6) Sconti fissati lato server (nessun input utente)
+    #    - upgrade   → 1%
+    #    - downgrade → 99%
+    raw_discounts = [RawDiscountSpec.percent(1.0)] if is_upgrade else [RawDiscountSpec.percent(99.0)]
+
+    # 7) Preparazione selector Portal con FAST-PATH via configuration_id cache
+    plan_for_target = (body.target_plan_type or current_plan_type)
+    headline = f"{current_plan_type} – {'Confirm upgrade' if is_upgrade else 'Confirm downgrade'}"
+
+    cfg_key = _cfg_key(plan_for_target, variants_override, features, headline)
+    cached_cfg_id = _config_cache_get(cfg_key)
+
+    if cached_cfg_id:
+        selector = PortalConfigSelector(configuration_id=cached_cfg_id)
+    else:
+        selector = PortalConfigSelector(
+            plan_type=plan_for_target,
+            variants_override=variants_override,
+            features_override=features,
+            business_profile_override={"headline": headline},
+        )
+
+    # 8) Risoluzione target_price_id con FAST-PATH via price cache (se non passato)
+    target_price_id = body.target_price_id
+    if not target_price_id and target_variant:
+        cached_price = _price_cache_get(plan_for_target, target_variant)
+        if cached_price:
+            target_price_id = cached_price
+
+    # 9) Costruisci la richiesta tipizzata verso l'API livello 1
+    req = PortalUpgradeDeepLinkRequest(
+        return_url=(body.return_url or RETURN_URL or PLANS_SUCCESS_URL_DEF),
+        subscription_id=sub_id,
+        portal=selector,
+        # target by price OR by plan+variant
+        target_price_id=target_price_id,
+        target_plan_type=plan_for_target,
+        target_variant=body.target_variant,
+        quantity=1,
+        # sconti decisi lato server:
+        raw_discounts=raw_discounts,
+    )
+
+    # 10) Invoca L1 e applica politiche di cache in base alla risposta
+    try:
+        dl = await _sdk(client.create_deeplink_upgrade, req)
+
+        # Cache configuration_id se non era in cache
+        try:
+            if not cached_cfg_id and getattr(dl, "configuration_id", None):
+                _config_cache_put(cfg_key, dl.configuration_id)
+        except Exception:
+            pass
+
+        # Cache price_id se L1 lo ha risolto e non lo avevamo
+        try:
+            resolved_price = getattr(dl, "target_price_id", None)
+            if not target_price_id and resolved_price and target_variant:
+                _price_cache_put(plan_for_target, target_variant, resolved_price)
+                target_price_id = resolved_price
+        except Exception:
+            pass
+
+        # Risposta completa (mantiene parità funzionale + arricchisce con price_id se noto)
+        resp: Dict[str, Any] = {
+            "deeplink_id": dl.id,
+            "url": dl.url,
+            "configuration_id": dl.configuration_id,
+            "subscription_id": sub_id,
+            "change_kind": "upgrade" if is_upgrade else "downgrade",
+            "applied_discount_percent": 1.0 if is_upgrade else 99.0,
+        }
+        if target_price_id:
+            resp["target_price_id"] = target_price_id
+        return resp
+
+    except ApiError as e:
+        raise HTTPException(status_code=getattr(e, "status_code", 500), detail=getattr(e, "payload", str(e)))
+
+
+# -----------------------------------------------------------------------------
+# --- [FIX] POST /payments/deeplink/cancel ------------------------------------
+# -----------------------------------------------------------------------------
+@app.post("/payments/deeplink/cancel", response_model=Dict[str, Any])
+async def create_cancel_deeplink(body: DeeplinkCancelIn):
+    if REQUIRED_AUTH:
+        verify_access_token(body.token, cognito_sdk)
+
+    client = _mk_plans_client(body.token)
+
+    sub_id = await _find_current_subscription_id(client)
+    if not sub_id:
+        raise HTTPException(404, "Nessuna subscription attiva trovata")
+
+    state = await _sdk(client.get_subscription_resources, sub_id)
+
+    # ricava plan_type/variant per preset di fallback
+    plan_type = getattr(state, "plan_type", None) or (getattr(state, "raw", {}) or {}).get("plan_type")
+    variant   = getattr(state, "variant",   None) or (getattr(state, "raw", {}) or {}).get("variant")
+    if not plan_type:
+        raise HTTPException(409, "Impossibile dedurre il plan_type dalla subscription corrente")
+
+    # Requisito server: almeno uno tra variants_override o portal_preset.
+    # Usiamo SEMPRE variants_override (derivato dal catalogo) per essere espliciti.
+    catalog  = body.variants_catalog or VARIANTS_BUCKET
+    variants = build_variants_for_intent(current_variant=variant, intent=ChangeIntent.both, catalog=catalog)
+
+    portal_block: Dict[str, Any] = {
+        "plan_type": plan_type,
+        "variants_override": variants,  # soddisfa il requisito server
+        # "portal_preset": body.portal_preset or _variant_to_portal_preset(variant),  # opzionale
+        "features_override": {
+            "payment_method_update": {"enabled": True},
+            "subscription_cancel": {
+                "enabled": True,
+                "mode": "immediately" if body.immediate else "at_period_end",
+            },
+        },
+        "business_profile_override": {"headline": f"{plan_type} – Cancel subscription"},
+    }
+
+    req = PortalCancelDeepLinkRequest(
+        return_url=(body.return_url or RETURN_URL or PLANS_SUCCESS_URL_DEF),
+        subscription_id=sub_id,
+        portal=portal_block,   # ← contiene variants_override esplicito
+        immediate=body.immediate,
+    )
+
+    try:
+        dl = await _sdk(client.create_deeplink_cancel, req)
+        return {"deeplink_id": dl.id, "url": dl.url, "configuration_id": dl.configuration_id}
+    except ApiError as e:
+        raise HTTPException(status_code=getattr(e, "status_code", 500), detail=getattr(e, "payload", str(e)))
+
+

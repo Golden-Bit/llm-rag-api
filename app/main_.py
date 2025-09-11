@@ -21,10 +21,30 @@ from PIL import Image, TiffImagePlugin
 import tempfile
 import os, math, json
 import httpx
+from typing import Literal, Optional, Dict, Any, Union, Annotated
+from pydantic import BaseModel, Field
 from app.auth_sdk.sdk import CognitoSDK, AccessTokenRequest
+from app.payments_sdk.sdk import (
+    ApiError,
+    MePlansClient,
+    DynamicCheckoutRequest,
+    PortalSessionRequest,          # <-- nuovo
+    PortalConfigSelector,
+    PortalUpdateDeepLinkRequest,
+    PortalCancelDeepLinkRequest,
+    PortalUpgradeDeepLinkRequest,  # <-- nuovo
+    RawDiscountSpec,               # <-- nuovo
+    ResourcesState,
+    DynamicResource,
+)
+from pydantic import BaseModel, Field, model_validator
 from app.system_messages.client_tools_utilities import ToolSpec
 from app.system_messages.system_message_1 import get_system_message
-
+from app.utils.payments_utils import (_mk_plans_client, _find_current_subscription_id, _sdk, PLANS_SUCCESS_URL_DEF, \
+                                      PLANS_CANCEL_URL_DEF, _variant_to_portal_preset, VARIANTS_BUCKET, RETURN_URL,
+                                      _dataclass_to_dict,
+                                      build_variants_for_intent, ChangeIntent, features_for_update, _sorted_variants,
+                                      _variant_value)
 app = FastAPI(
     root_path="/llm-rag"
 )
@@ -1072,6 +1092,12 @@ async def upload_file_to_multiple_contexts_async(
     if REQUIRED_AUTH:
         verify_access_token(token, cognito_sdk)
 
+    print("#" * 120)
+    print(json.dumps(loaders, indent=2))
+    print("#"*120)
+    print(json.dumps(loader_kwargs, indent=2))
+    print("#" * 120)
+
     ####################################################################################################################
     # TODO:
     #  - verifica se in path è presente prefisso, altrimenti aggiungi (dovremo richiedere anche username in input)
@@ -1371,12 +1397,16 @@ class ConfigureAndLoadChainInput(BaseModel):
     llm: Optional[LLMConfig] = None
     model_name: Optional[str] = "gpt-4o"  # Nome del modello, default "gpt-4o-mini"
     system_message: Optional[str] = "You are an helpful assistant."
-
-    tool_specs     : List[ToolSpec] = Field(
+    system_message_content: Optional[str] = Field(
+        default = None,
+        description = "Se fornito, verrà aggiunto in coda al sistema di default sotto una sezione 'Additional Instructions'.")
+    custom_server_tools: List[Dict[str, Any]] = Field(
+        default_factory = list,
+        description = 'Lista di tool ({"name":..., "kwargs":{...}}) da aggiungere o con cui sovrascrivere quelli di default.')
+    client_tool_specs : List[ToolSpec] = Field(
         default_factory=list,
         description="Elenco facoltativo di tool/widget da documentare"
     )
-
     token: Optional[str] = None
 
 # -----------------------------------------------------------------------------
@@ -1447,7 +1477,7 @@ async def configure_and_load_chain(
 
 
 
-    client_tool_specs = [t.build_widget_instructions() for t in input_data.tool_specs]
+    client_tool_specs = [t.build_widget_instructions() for t in input_data.client_tool_specs]
 
 
 
@@ -1552,6 +1582,17 @@ async def configure_and_load_chain(
     {json.dumps(contexts_data, indent=4).replace('{', '{{').replace('}', '}}')}
     -----------------------------------------------------------------------------------------------------
     """
+
+    # ── Se ho del testo extra da appendere, lo aggiungo in coda ──────────────
+
+    if input_data.system_message_content:
+        system_message += (
+            "\n\n## ADDITIONAL INSTRUCTIONS\n"
+            "-----------------------------------------------------------------------------------------------------"
+            f"{input_data.system_message_content}"
+            "-----------------------------------------------------------------------------------------------------"
+        )
+
     ####################################################################################################################
 
     # vector_store_config_id = f"{context}_vector_store_config"
@@ -1598,14 +1639,22 @@ async def configure_and_load_chain(
 
     # vectorstore_ids = [vector_store_id]
 
-    tools = [{"name": "VectorStoreTools", "kwargs": {"store_id": vectorstore_id}} for vectorstore_id in vectorstore_ids]
+    default_tools = [{"name": "VectorStoreTools", "kwargs": {"store_id": vectorstore_id}} for vectorstore_id in vectorstore_ids]
 
-    tools.append({"name": "MongoDBTools",
+    default_tools.append({"name": "MongoDBTools",
                   "kwargs": {
                       "connection_string": "mongodb://localhost:27017",
                       "default_database": f"default_db",
                       "default_collection": "default_collection"
                   }})
+
+    # ── Applico le custom_tools: sovrascrivo o aggiungo ────────────────────
+    tools_by_name = {t["name"]: t for t in default_tools}
+
+    for ct in input_data.custom_server_tools:
+        tools_by_name[ct["name"]] = ct
+    tools = list(tools_by_name.values())
+
 
     # Configurazione della chain
     chain_config = {
@@ -1617,7 +1666,10 @@ async def configure_and_load_chain(
         "tools": tools,
         "extra_metadata": {
             "contexts": contexts,
-            "model_name": model_name
+            "model_name": model_name,
+            "system_message_content": input_data.system_message_content,
+            "custom_server_tools": input_data.custom_server_tools,
+            #"client_tool_specs":  input_data.client_tool_specs
     }
     }
 
@@ -2141,20 +2193,74 @@ async def loader_kwargs_schema():
             }
         },
         "UnstructuredLoader": {
+  "mode": {
+    "name": "mode",
+    "type": "string",
+    "default": "single",
+    "items": ["single", "elements"],
+    "example": "elements",
+    #"description": "– “single”: ritorna un unico Document con tutto il contenuto.  \n– “elements”: un Document per ogni elemento estratto (paragrafi, titoli, immagini, PageBreak…)."
+  },
+  "chunking_strategy": {
+    "name": "chunking_strategy",
+    "type": "string",
+    "default": "basic",
+    "items": ["basic", "by_title"], #, "by_page", "by_similarity"],
+    "example": "basic",
+    #"description": "Strategia di suddivisione in chunk:  \n– basic: fill fino ai limiti di caratteri  \n– by_title: split su ogni Title  \n– by_page: un chunk = una pagina (tramite API)  \n– by_similarity: group topic‑wise (tramite API)"
+  },
             "strategy": {
                 "name": "strategy",
                 "type": "string",
-                "default": "hi_res",
-                "items": ["hi_res", "fast", "auto"],
-                "example": "fast"
+                "default": "auto",
+                "items": ["auto", "fast", "hi_res", "ocr_only"],
+                "example": "fast",
+                #"description": "Modalità di parsing per PDF/immagini: “fast” per velocità, “hi_res” per layout di precisione, “ocr_only” per solo OCR."
             },
+  "max_characters": {
+    "name": "max_characters",
+    "type": "integer",
+    "default": 500,
+    "example": 1500,
+    #"description": "Hard cap sul numero massimo di caratteri per chunk."
+  },
+  "new_after_n_chars": {
+    "name": "new_after_n_chars",
+    "type": "integer",
+    "default": 500,
+    "example": 1000,
+    #"description": "Soft cap: suggerisce il punto di break, fino a un massimo di max_characters."
+  },
+  "overlap": {
+    "name": "overlap",
+    "type": "integer",
+    "default": 0,
+    "example": 200,
+    #"description": "Numero di caratteri ripresi all’inizio di ogni nuovo chunk."
+  },
+  "overlap_all": {
+    "name": "overlap_all",
+    "type": "boolean",
+    "default": False,
+    "example": False,
+    #"description": "Se true applica overlap anche fra chunk che non superano max_characters."
+  },
+  "include_page_breaks": {
+    "name": "include_page_breaks",
+    "type": "boolean",
+    "default": False,
+    "example": True,
+    #"description": "Inietta elementi PageBreak nei risultati per mantenere i confini di pagina."
+  },
             "partition_via_api": {
                 "name": "partition_via_api",
                 "type": "boolean",
                 "default": False,
-                "example": False
-            }
-        }
+                "example": False,
+                #"description": "Se true forza l’uso del Partition Endpoint remoto invece del parsing locale."
+            },
+}
+
     }
 
 
@@ -2830,3 +2936,487 @@ async def image_to_base64(
         # Log di debug lato server, ma maschera il messaggio verso il client
         print(f"[image_to_base64] errore non gestito: {exc}")
         raise HTTPException(500, "Errore interno in image_to_base64")
+
+
+
+# --- [NEW] Schemi input/output endpoint Payments ----------------------------
+class CurrentPlanResponse(BaseModel):
+    subscription_id: str
+    status: str | None = None
+    plan_type: str | None = None
+    variant: str | None = None
+    pricing_method: str | None = None
+    active_price_id: str | None = None
+    period_start: int | None = None
+    period_end: int | None = None
+
+class CheckoutVariantIn(BaseModel):
+    token: str | None = None
+    plan_type: str
+    variant: str
+    locale: str | None = "it"
+    success_url: str | None = None
+    cancel_url: str | None = None
+
+class PortalSessionIn(BaseModel):
+    token: Optional[str] = None
+    return_url: Optional[str] = None
+
+
+class DeeplinkUpgradeIn(BaseModel):
+    token: Optional[str] = None
+    return_url: Optional[str] = None
+
+    # target: EITHER target_price_id OR (target_plan_type + target_variant)
+    target_price_id: Optional[str] = None
+    target_plan_type: Optional[str] = None
+    target_variant: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _validate_target(self):
+        if not self.target_price_id and not (self.target_plan_type and self.target_variant):
+            raise ValueError("Devi fornire target_price_id oppure target_plan_type + target_variant.")
+        return self
+
+
+class DeeplinkUpdateIn(BaseModel):
+    token: Optional[str] = None
+    return_url: Optional[str] = None
+    change_intent: Optional[ChangeIntent] = Field(default=ChangeIntent.both)
+    # opzionale: se passato dal client, lo rifiltriamo comunque in base all'intent
+    variants_override: Optional[List[str]] = None
+    # catalogo base quando variants_override non è passato
+    variants_catalog: Optional[List[str]] = None
+
+class DeeplinkCancelIn(BaseModel):
+    token: Optional[str] = None
+    return_url: Optional[str] = None
+    immediate: bool = True
+    # facoltativo: utile solo se il backend richiede anche un preset
+    portal_preset: Optional[str] = None
+    # per soddisfare il requisito server "portal_preset o variants_override"
+    variants_catalog: Optional[List[str]] = None
+
+class CheckoutSuccess(BaseModel):
+    status: Literal["checkout"]
+    checkout_session_id: str
+    url: str
+    customer_id: Optional[str] = None
+    created_product_id: Optional[str] = None
+    created_price_id: Optional[str] = None
+
+class PortalRedirect(BaseModel):
+    status: Literal["portal_redirect"]
+    reason_code: str
+    message: str
+    portal_url: str
+    subscription_id: str
+    configuration_id: str
+
+CheckoutOrPortal = Annotated[Union[CheckoutSuccess, PortalRedirect], Field(discriminator="status")]
+
+
+# --- [NEW] GET /payments/current_plan ---------------------------------------
+@app.get("/payments/current_plan", response_model=CurrentPlanResponse)
+async def get_current_plan(
+    token: str | None = Query(None, description="Access token dell'utente"),
+):
+    if REQUIRED_AUTH:
+        verify_access_token(token, cognito_sdk)
+
+    client = _mk_plans_client(token)
+
+    sub_id = await _find_current_subscription_id(client)
+    if not sub_id:
+        raise HTTPException(404, "Nessuna subscription attiva trovata")
+
+    # Prendo lo stato risorse per ottenere plan/variant/pricing_method/periodi
+    state: ResourcesState = await _sdk(client.get_subscription_resources, sub_id)
+
+    # opzionale: leggo anche la subscription grezza per lo status
+    sub = await _sdk(client.get_subscription, sub_id)
+    status = (sub or {}).get("status")
+
+    return CurrentPlanResponse(
+        subscription_id=sub_id,
+        status=status,
+        plan_type=state.plan_type,
+        variant=state.variant,
+        pricing_method=state.pricing_method,
+        active_price_id=state.active_price_id,
+        period_start=state.period_start,
+        period_end=state.period_end,
+    )
+
+
+# --- [NEW] GET /payments/credits --------------------------------------------
+# --- [REWRITE] GET /payments/credits  ---------------------------------------
+@app.get("/payments/credits", response_model=Dict[str, Any])
+async def get_user_credits(
+    token: str | None = Query(None, description="Access token dell'utente"),
+    subscription_id: str | None = Query(None, description="Se non fornito, uso la subscription viva"),
+):
+    if REQUIRED_AUTH:
+        verify_access_token(token, cognito_sdk)
+
+    client = _mk_plans_client(token)
+
+    sub_id = subscription_id or await _find_current_subscription_id(client)
+    if not sub_id:
+        raise HTTPException(404, "Nessuna subscription attiva trovata")
+
+    # Legge lo stato risorse via SDK
+    state: ResourcesState = await _sdk(client.get_subscription_resources, sub_id)
+
+    # Normalizza ad un dict (funzione già presente nel tuo codice)
+    data = _dataclass_to_dict(state) if hasattr(state, "__dataclass_fields__") else (
+        getattr(state, "raw", None) or state
+    )
+
+    resources = (data.get("resources") or {})
+    provided_list  = resources.get("provided")  or []
+    used_list      = resources.get("used")      or []
+    remaining_list = resources.get("remaining") or []
+
+    def _sum_credits(items) -> float:
+        total = 0.0
+        for it in items:
+            # supporta sia dict sia eventuali oggetti con attributi
+            key = (it.get("key") if isinstance(it, dict) else getattr(it, "key", None)) or ""
+            if key.lower() != "credits":
+                continue
+            qty = (it.get("quantity") if isinstance(it, dict) else getattr(it, "quantity", 0)) or 0
+            try:
+                total += float(qty)
+            except Exception:
+                pass
+        return total
+
+    provided  = _sum_credits(provided_list)
+    used      = _sum_credits(used_list)
+    remaining = _sum_credits(remaining_list)
+
+    # formato pulito: solo i totali dei crediti
+    def _fmt(x: float):
+        try:
+            return int(x) if float(x).is_integer() else round(float(x), 4)
+        except Exception:
+            return x
+
+    return {
+        "provided_total":  _fmt(provided),
+        "used_total":      _fmt(used),
+        "remaining_total": _fmt(remaining),
+    }
+
+
+# --- [NEW] POST /payments/checkout ------------------------------------------
+@app.post("/payments/checkout", response_model=CheckoutOrPortal)  # oppure Dict[str, Any]
+async def create_checkout_session_variant(body: CheckoutVariantIn):
+    """
+    Genera una Checkout Session per VARIANTE di catalogo usando lo SDK.
+    Se il server risponde 409 single_subscription_portal_redirect,
+    ritorna un payload 'portal_redirect' con l'URL del Billing Portal.
+    """
+    if REQUIRED_AUTH:
+        verify_access_token(body.token, cognito_sdk)
+
+    client = _mk_plans_client(body.token)
+
+    req = DynamicCheckoutRequest(
+        success_url=(body.success_url or PLANS_SUCCESS_URL_DEF),
+        cancel_url=(body.cancel_url or PLANS_CANCEL_URL_DEF),
+        plan_type=body.plan_type,
+        variant=body.variant,
+        locale=body.locale,
+        portal={
+            "plan_type": body.plan_type,
+            "variants_override": VARIANTS_BUCKET,
+            "features_override": {
+                "payment_method_update": {"enabled": True},
+                "subscription_update": {
+                    "enabled": True,
+                    "default_allowed_updates": ["price"],
+                    "proration_behavior": "none"
+                },
+                "subscription_cancel": {"enabled": True, "mode": "immediately"}
+            },
+            "business_profile_override": {"headline": f"{body.plan_type} – Manage plan"},
+        },
+    )
+
+    try:
+        out = await _sdk(client.create_checkout, req)
+        return CheckoutSuccess(
+            status="checkout",
+            checkout_session_id=out.id,
+            url=out.url,
+            customer_id=out.customer_id,
+            created_product_id=out.created_product_id,
+            created_price_id=out.created_price_id,
+        )
+
+    except ApiError as e:
+        # Gestione specifica del redirect al Billing Portal
+        if e.status_code == 409 and isinstance(e.payload, dict):
+            detail = (e.payload.get("detail") or {}) if isinstance(e.payload, dict) else {}
+            if detail.get("code") == "single_subscription_portal_redirect":
+                return PortalRedirect(
+                    status="portal_redirect",
+                    reason_code=detail.get("code", "single_subscription_portal_redirect"),
+                    message=detail.get("message", "Aggiorna il piano esistente dal Billing Portal."),
+                    portal_url=detail.get("portal_url"),
+                    subscription_id=detail.get("subscription_id"),
+                    configuration_id=detail.get("configuration_id"),
+                )
+        # Altri errori → propaghiamo come HTTPException FastAPI
+        raise HTTPException(status_code=e.status_code, detail=e.payload)
+
+@app.post("/payments/portal_session", response_model=Dict[str, Any])
+async def create_portal_session(body: PortalSessionIn):
+    if REQUIRED_AUTH:
+        verify_access_token(body.token, cognito_sdk)
+
+    client = _mk_plans_client(body.token)
+
+    # trova la subscription viva
+    sub_id = await _find_current_subscription_id(client)
+    if not sub_id:
+        raise HTTPException(404, "Nessuna subscription attiva trovata")
+
+    # ricava plan_type per costruire la config (il portal la vuole)
+    state = await _sdk(client.get_subscription_resources, sub_id)
+    plan_type = getattr(state, "plan_type", None) or (state.raw.get("plan_type") if hasattr(state, "raw") else None)
+    if not plan_type:
+        raise HTTPException(409, "Impossibile dedurre il plan_type dalla subscription corrente")
+
+    # ⚙️ Configurazione Portal: NIENTE cambio piano; PM visibile; cancel al period end.
+    # NB: Stripe Billing Portal NON espone un flow "pause" nativo; per la pausa usa l'endpoint dedicato.
+    req = PortalSessionRequest(
+        return_url=(body.return_url or RETURN_URL or PLANS_SUCCESS_URL_DEF),
+        portal=PortalConfigSelector(
+            plan_type=plan_type,
+            # Stripe richiede 'variants_override' O 'portal_preset' per configurazioni legate ai piani:
+            variants_override=VARIANTS_BUCKET,
+            features_override={
+                "payment_method_update": {"enabled": True},
+                "subscription_update": {"enabled": False},
+                "subscription_cancel": {"enabled": True, "mode": "at_period_end"},
+                "invoice_history": {"enabled": True},
+            },
+            business_profile_override={"headline": f"{plan_type} – Manage billing"},
+        ),
+        flow_data=None,
+    )
+
+    try:
+        sess = await _sdk(client.create_portal_session, req)
+        return {"portal_session_id": sess.id, "url": sess.url, "configuration_id": sess.configuration_id}
+    except ApiError as e:
+        raise HTTPException(status_code=getattr(e, "status_code", 500), detail=getattr(e, "payload", str(e)))
+
+
+# -----------------------------------------------------------------------------
+# --- [FIX] POST /payments/deeplink/update ------------------------------------
+# -----------------------------------------------------------------------------
+@app.post("/payments/deeplink/update", response_model=Dict[str, Any])
+async def create_update_deeplink(body: DeeplinkUpdateIn):
+    if REQUIRED_AUTH:
+        verify_access_token(body.token, cognito_sdk)
+
+    client = _mk_plans_client(body.token)
+
+    sub_id = await _find_current_subscription_id(client)
+    if not sub_id:
+        raise HTTPException(404, "Nessuna subscription attiva trovata")
+
+    state = await _sdk(client.get_subscription_resources, sub_id)
+    plan_type = getattr(state, "plan_type", None) or (state.raw.get("plan_type") if hasattr(state, "raw") else None)
+    variant   = getattr(state, "variant", None)    or (state.raw.get("variant")    if hasattr(state, "raw") else None)
+    if not plan_type:
+        raise HTTPException(409, "Impossibile dedurre il plan_type dalla subscription corrente")
+
+    # ▼ Catalogo base → filtro per intent
+    base_catalog = body.variants_catalog or VARIANTS_BUCKET
+    base_filtered = build_variants_for_intent(
+        current_variant=variant,
+        intent=body.change_intent,
+        catalog=base_catalog,
+    )
+    # se il client ha passato una override, la riconfiniamo comunque all'intent
+    effective_override = body.variants_override or base_filtered
+    effective_override = build_variants_for_intent(
+        current_variant=variant,
+        intent=body.change_intent,
+        catalog=effective_override,
+    )
+
+    feat = features_for_update(body.change_intent)  # upgrade immediato, downgrade fine periodo
+
+    portal_block: Dict[str, Any] = {
+        "plan_type": plan_type,
+        "variants_override": effective_override,
+        "features_override": feat,
+        "business_profile_override": {"headline": f"{plan_type} – Update plan"},
+    }
+
+    req = PortalUpdateDeepLinkRequest(
+        return_url=(body.return_url or RETURN_URL or PLANS_SUCCESS_URL_DEF),
+        subscription_id=sub_id,
+        portal=portal_block,  # dict compatibile con lo SDK (selector/override lato backend)
+    )
+
+    try:
+        dl = await _sdk(client.create_deeplink_update, req)
+        return {"deeplink_id": dl.id, "url": dl.url, "configuration_id": dl.configuration_id}
+    except ApiError as e:
+        raise HTTPException(status_code=getattr(e, "status_code", 500), detail=getattr(e, "payload", str(e)))
+
+
+@app.post("/payments/deeplink/upgrade", response_model=Dict[str, Any])
+async def create_upgrade_deeplink(body: DeeplinkUpgradeIn):
+    if REQUIRED_AUTH:
+        verify_access_token(body.token, cognito_sdk)
+
+    client = _mk_plans_client(body.token)
+
+    # 1) subscription viva
+    sub_id = await _find_current_subscription_id(client)
+    if not sub_id:
+        raise HTTPException(404, "Nessuna subscription attiva trovata")
+
+    # 2) stato corrente (per plan_type/variant e per costruire la Portal Configuration mirata)
+    state = await _sdk(client.get_subscription_resources, sub_id)
+    current_plan_type = getattr(state, "plan_type", None) or (state.raw.get("plan_type") if hasattr(state, "raw") else None)
+    current_variant   = getattr(state, "variant", None)    or (state.raw.get("variant")    if hasattr(state, "raw") else None)
+    if not current_plan_type:
+        raise HTTPException(409, "Impossibile dedurre il plan_type dalla subscription corrente")
+
+    # 3) Catalogo per la Portal Configuration: limitiamo a "current + target" se noto
+    base_catalog = VARIANTS_BUCKET
+    target_variant = body.target_variant
+
+    if target_variant and current_variant:
+        variants_override = _sorted_variants([v for v in base_catalog if v in {current_variant, target_variant}])
+    else:
+        # Se non conosco la variant target (es. arrivo da target_price_id), mostro comunque current + bucket
+        # per rendere coerente la UI del Portal
+        variants_override = _sorted_variants([current_variant] + base_catalog) if current_variant else base_catalog
+
+    # 4) Rilevazione automatica upgrade vs downgrade (solo se conosco entrambe le varianti)
+    #    - upgrade:  target_value > current_value
+    #    - downgrade: target_value < current_value
+    #    - altrimenti: default a "upgrade"
+    is_upgrade = True
+    if current_variant and target_variant:
+        is_upgrade = _variant_value(target_variant) > _variant_value(current_variant)
+
+    # 5) features del Portal a corredo del deeplink confermato:
+    #    - upgrade: proration immediata (fattura/conguaglio subito)
+    #    - downgrade: nessuna proration (effetto economico alla fine del periodo)
+    features = {
+        "payment_method_update": {"enabled": True},
+        "subscription_update": {
+            "enabled": True,
+            "default_allowed_updates": ["price"],
+            "proration_behavior": "always_invoice" if is_upgrade else "none",
+        },
+        "subscription_cancel": {"enabled": True, "mode": "at_period_end"},
+    }
+
+    # 6) SCONTI fissati lato server (niente input utente):
+    #    - upgrade  → 1%
+    #    - downgrade→ 99%
+    #    Li passiamo come raw_discounts che il livello 1 trasforma in Coupon.
+    raw_discounts = [RawDiscountSpec.percent(1.0)] if is_upgrade else [RawDiscountSpec.percent(99.0)]
+
+    # 7) Costruisci la richiesta tipizzata verso l'API livello 1
+    req = PortalUpgradeDeepLinkRequest(
+        return_url=(body.return_url or RETURN_URL or PLANS_SUCCESS_URL_DEF),
+        subscription_id=sub_id,
+        portal=PortalConfigSelector(
+            plan_type=(body.target_plan_type or current_plan_type),
+            variants_override=variants_override,
+            features_override=features,
+            business_profile_override={
+                "headline": f"{current_plan_type} – {'Confirm upgrade' if is_upgrade else 'Confirm downgrade'}"
+            },
+        ),
+        # target by price OR by plan+variant
+        target_price_id=body.target_price_id,
+        target_plan_type=(body.target_plan_type or current_plan_type),
+        target_variant=body.target_variant,
+        quantity= 1,
+        # sconti decisi lato server:
+        raw_discounts=raw_discounts,
+    )
+
+    try:
+        dl = await _sdk(client.create_deeplink_upgrade, req)
+        return {
+            "deeplink_id": dl.id,
+            "url": dl.url,
+            "configuration_id": dl.configuration_id,
+            "subscription_id": sub_id,
+            "change_kind": "upgrade" if is_upgrade else "downgrade",
+            "applied_discount_percent": 1.0 if is_upgrade else 99.0,
+        }
+    except ApiError as e:
+        raise HTTPException(status_code=getattr(e, "status_code", 500), detail=getattr(e, "payload", str(e)))
+
+
+# -----------------------------------------------------------------------------
+# --- [FIX] POST /payments/deeplink/cancel ------------------------------------
+# -----------------------------------------------------------------------------
+@app.post("/payments/deeplink/cancel", response_model=Dict[str, Any])
+async def create_cancel_deeplink(body: DeeplinkCancelIn):
+    if REQUIRED_AUTH:
+        verify_access_token(body.token, cognito_sdk)
+
+    client = _mk_plans_client(body.token)
+
+    sub_id = await _find_current_subscription_id(client)
+    if not sub_id:
+        raise HTTPException(404, "Nessuna subscription attiva trovata")
+
+    state = await _sdk(client.get_subscription_resources, sub_id)
+
+    # ricava plan_type/variant per preset di fallback
+    plan_type = getattr(state, "plan_type", None) or (getattr(state, "raw", {}) or {}).get("plan_type")
+    variant   = getattr(state, "variant",   None) or (getattr(state, "raw", {}) or {}).get("variant")
+    if not plan_type:
+        raise HTTPException(409, "Impossibile dedurre il plan_type dalla subscription corrente")
+
+    # Requisito server: almeno uno tra variants_override o portal_preset.
+    # Usiamo SEMPRE variants_override (derivato dal catalogo) per essere espliciti.
+    catalog  = body.variants_catalog or VARIANTS_BUCKET
+    variants = build_variants_for_intent(current_variant=variant, intent=ChangeIntent.both, catalog=catalog)
+
+    portal_block: Dict[str, Any] = {
+        "plan_type": plan_type,
+        "variants_override": variants,  # soddisfa il requisito server
+        # "portal_preset": body.portal_preset or _variant_to_portal_preset(variant),  # opzionale
+        "features_override": {
+            "payment_method_update": {"enabled": True},
+            "subscription_cancel": {
+                "enabled": True,
+                "mode": "immediately" if body.immediate else "at_period_end",
+            },
+        },
+        "business_profile_override": {"headline": f"{plan_type} – Cancel subscription"},
+    }
+
+    req = PortalCancelDeepLinkRequest(
+        return_url=(body.return_url or RETURN_URL or PLANS_SUCCESS_URL_DEF),
+        subscription_id=sub_id,
+        portal=portal_block,   # ← contiene variants_override esplicito
+        immediate=body.immediate,
+    )
+
+    try:
+        dl = await _sdk(client.create_deeplink_cancel, req)
+        return {"deeplink_id": dl.id, "url": dl.url, "configuration_id": dl.configuration_id}
+    except ApiError as e:
+        raise HTTPException(status_code=getattr(e, "status_code", 500), detail=getattr(e, "payload", str(e)))
+
+
