@@ -23,7 +23,7 @@ from app.payments_sdk.sdk import (
 
 ########################################################################################################################
 # --- [NEW] Payments config ---------------------------------------------------
-PLANS_API_BASE         = os.getenv("PLANS_API_BASE", "http://localhost:8002").rstrip("/")
+PLANS_API_BASE         = os.getenv("PLANS_API_BASE", "http://localhost:8222").rstrip("/")
 PLANS_ADMIN_API_KEY    = os.getenv("PLANS_ADMIN_API_KEY", "adminkey123:admin")
 PLANS_STRIPE_ACCOUNT   = os.getenv("PLANS_STRIPE_ACCOUNT", None)
 PLANS_SUCCESS_URL_DEF  = os.getenv("PLANS_SUCCESS_URL", "https://tuo-sito.com/success?cs_id={CHECKOUT_SESSION_ID}")
