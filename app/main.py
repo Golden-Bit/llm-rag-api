@@ -45,7 +45,7 @@ from app.utils.payments_utils import (_mk_plans_client, _find_current_subscripti
                                       _dataclass_to_dict,
                                       build_variants_for_intent, ChangeIntent, features_for_update, _sorted_variants,
                                       _variant_value, _cfg_key, _config_cache_get, _config_cache_put, _price_cache_put,
-                                      _price_cache_get)
+                                      _price_cache_get, _consume_credits_or_402)
 app = FastAPI(
     root_path="/llm-rag"
 )
@@ -1030,9 +1030,10 @@ async def upload_file_to_multiple_contexts(
         description: Optional[str] = Form(None),
         extra_metadata: Optional[Any] = Form(None),
         username: Optional[str] = Form(None),
-        token: Optional[str] = Form(None),
         loaders: Optional[str] = Form(None),
         loader_kwargs: Optional[str] = Form(None),
+        token: Optional[str] = Form(None),
+        subscription_id: Optional[str] = Form(None),
 ):
 
     if REQUIRED_AUTH:
@@ -1067,6 +1068,35 @@ async def upload_file_to_multiple_contexts(
     if extra_metadata:
         file_metadata.update(extra_metadata)
 
+    # ============================================================
+    # 1) STIMA COSTO (riusiamo direttamente l’endpoint-funzione)
+    #    NB: estimate_file_processing_cost consuma lo stream -> reset poi
+    # ============================================================
+    est = await estimate_file_processing_cost(
+        files=[file],
+        loader_kwargs=(loader_kwargs or None)  # passiamo la stringa originale
+    )
+    # il model pydantic è già serializzato: estraiamo il totale
+    credits_to_consume = est.grand_total
+
+    # Riposiziona lo stream del file, altrimenti l’upload leggerà 0 byte
+    try:
+        await file.seek(0)
+    except Exception:
+        if hasattr(file, "file"):
+            file.file.seek(0)
+
+    # ============================================================
+    # 2) CONSUMO CREDITI
+    # ============================================================
+    await _consume_credits_or_402(
+        token,
+        credits_to_consume,
+        reason=f"upload+processing file={file.filename} contexts={contexts}",
+        subscription_id=subscription_id
+    )
+
+
     result = await upload_file_to_contexts(
         file,
         contexts,
@@ -1085,19 +1115,24 @@ async def upload_file_to_multiple_contexts_async(
     contexts: List[str] = Form(...),
     description: Optional[str] = Form(None),
     username: Optional[str] = Form(None),
-    token: Optional[str] = Form(None),
     loaders: Optional[str] = Form(None),
     loader_kwargs: Optional[str] = Form(None),
+    token: Optional[str] = Form(None),
+    subscription_id: Optional[str] = Form(None),
 ):
+
+    #print("*" * 120)
+    #print(token)
+    #print("*" * 120)
 
     if REQUIRED_AUTH:
         verify_access_token(token, cognito_sdk)
 
-    print("#" * 120)
-    print(json.dumps(loaders, indent=2))
-    print("#"*120)
-    print(json.dumps(loader_kwargs, indent=2))
-    print("#" * 120)
+    #print("#" * 120)
+    #print(json.dumps(loaders, indent=2))
+    #print("#"*120)
+    #print(json.dumps(loader_kwargs, indent=2))
+    #print("#" * 120)
 
     ####################################################################################################################
     # TODO:
@@ -1124,6 +1159,30 @@ async def upload_file_to_multiple_contexts_async(
         raise HTTPException(422, f"Parametri JSON non validi: {e}")
 
     file_meta = {"description": description} if description else None
+
+    # ============================================================
+    # === 1) STIMA COSTO (riuso funzione endpoint) ===
+    est = await estimate_file_processing_cost(
+        files=[file],
+        loader_kwargs=(loader_kwargs or None)
+    )
+    credits_to_consume = est.grand_total
+
+    # reset stream per i task successivi
+    try:
+        await file.seek(0)
+    except Exception:
+        if hasattr(file, "file"):
+            file.file.seek(0)
+
+    # === 2) CONSUMO CREDITI ===
+    await _consume_credits_or_402(
+        token,
+        credits_to_consume,
+        reason=f"upload_async+processing file={file.filename} contexts={contexts}",
+        subscription_id=subscription_id
+    )
+
     return await upload_file_to_contexts_async(
         file,
         contexts,
@@ -1935,6 +1994,8 @@ async def get_tasks_status(
 #    inference_kwargs: Dict[str, Any] = Field(..., example={}, description="")
 
 class ExecuteChainRequest(BaseModel):
+    token: Optional[str] = Field(..., description="Access token used to identify user")
+    subscription_id: Optional[str] = Field(..., description="user's active subscription")
     chain_id: str = Field(..., description="The unique ID of the chain to execute.")
     # Legacy query (deprecato)
     query: Optional[Dict[str, Any]] = Field(
@@ -2025,8 +2086,46 @@ async def stream_events_chain(
     replica I/O byte-per-byte e mantiene lo stream invariato.
     """
 
-    #if REQUIRED_AUTH:
-    #    verify_access_token(token, cognito_sdk)
+    if REQUIRED_AUTH:
+        verify_access_token(body.token, cognito_sdk)
+
+    # === 1) ESTRAZIONE messaggio + history dal body ===
+    msg = None
+    hist = []
+    if body.query:
+        msg = (body.query or {}).get("input", "")
+        hist = (body.query or {}).get("chat_history", []) or []
+    else:
+        msg = body.input_text or ""
+        # body.chat_history è già nel formato nuovo [{'role':..., 'parts':[...]}, ...]
+        # per la stima usiamo la lista di coppie semplice (user/assistant) se disponibile
+        # fallback: serializza ruoli in una stringa flat
+        try:
+            hist = [[(h.get("role") or "user"), json.dumps(h.get("parts") or [])] for h in (body.chat_history or [])]
+        except Exception:
+            hist = []
+
+    # === 2) STIMA COSTO ===
+    icost = await estimate_chain_interaction_cost(
+        EstimateInteractionRequest(
+            chain_id=body.chain_id,
+            chain_config=None,
+            message=msg or "",
+            chat_history=hist or [],
+        )
+    )
+    credits_to_consume = icost.cost_total_usd
+
+    # === 3) CONSUMO CREDITI ===
+    # NB: qui il token non è passato come argomento esplicito;
+    #     se vuoi richiederlo sempre, aggiungi 'token: Optional[str]' nei parametri
+
+    await _consume_credits_or_402(
+        body.token,
+        credits_to_consume,
+        reason=f"chat.stream_events chain_id={body.chain_id} len(message)={len(msg or '')}",
+        subscription_id=body.subscription_id
+    )
 
     # ------------------------------------------------------------------ #
     # Wrapper per rilanciare upstream e ributtare giù i chunk “as-is”.   #
@@ -2276,10 +2375,10 @@ async def loader_kwargs_schema():
 # ─────────────────────────────────────────────────────────────────────────────
 # COST‑ESTIMATE ENDPOINT – formula, params, params_conditions
 # ─────────────────────────────────────────────────────────────────────────────
-HIRES_PRICE_PER_PAGE  = float(os.getenv("HIRES_PRICE_PER_PAGE",  "0.01"))   # USD
-FAST_PRICE_PER_PAGE   = float(os.getenv("FAST_PRICE_PER_PAGE",   "0.001"))
-IMAGE_FLAT_COST_USD   = float(os.getenv("IMAGE_FLAT_COST_USD",   "0.005"))  # USD / img
-VIDEO_PRICE_PER_MIN   = float(os.getenv("VIDEO_PRICE_PER_MIN",   "0.10"))   # USD / min
+HIRES_PRICE_PER_PAGE  = float(os.getenv("HIRES_PRICE_PER_PAGE",  "0.01")) * 1000  # USD
+FAST_PRICE_PER_PAGE   = float(os.getenv("FAST_PRICE_PER_PAGE",   "0.001")) * 1000
+IMAGE_FLAT_COST_USD   = float(os.getenv("IMAGE_FLAT_COST_USD",   "0.005")) * 1000  # USD / img
+VIDEO_PRICE_PER_MIN   = float(os.getenv("VIDEO_PRICE_PER_MIN",   "0.10"))  * 1000 # USD / min
 FALLBACK_KB_PER_PAGE  = 100                                                # ↳ csv / txt …
 TOKENS_PER_PAGE = 1000          # ≈ 1k‑token ≃ 4000 caratteri
 
@@ -2380,7 +2479,8 @@ def _choose_strategy(
             • se (kind==image) OR (size_bytes < 200 KB) → fast
             • altrimenti                               → hi_res
     """
-    raw = (kwargs or {}).get("strategy", "hi_res")
+
+    raw = (kwargs.get(ext[1:] if ext.startswith(".") else ext, {}) or {}).get("strategy", "hi_res")
 
     if raw != "auto":
         return raw            # 'hi_res' o 'fast' espliciti
@@ -2398,6 +2498,8 @@ async def estimate_file_processing_cost(
     #loaders      : str | None = Form(None),
     loader_kwargs: str | None = Form(None),
 ):
+
+
     try:
         kwargs_map  = json.loads(loader_kwargs) if loader_kwargs else {}
     except json.JSONDecodeError as e:
@@ -2464,6 +2566,7 @@ async def estimate_file_processing_cost(
 
             # ───── DOCUMENTI  ────────────────────────────────────────────
             strategy = _choose_strategy(kwargs_map, ext, size_b)
+
             price_page = _price_per_page(strategy)
 
             base_params = {
@@ -2552,6 +2655,7 @@ async def estimate_file_processing_cost(
             ))
 
     grand_total = round(sum(f.cost_usd or 0.0 for f in results), 4)
+
     return CostEstimateResponse(files=results, grand_total=grand_total)
 
 
@@ -2568,10 +2672,10 @@ from fastapi import HTTPException, Body
 from pydantic import BaseModel, Field
 
 # ╭──── prezzi (override via env) ───────────────────────────────────────────╮
-GPT4O_IN_PRICE        = float(os.getenv("GPT4O_IN_PRICE",        "0.01"))   # USD / 1k tok
-GPT4O_OUT_PRICE       = float(os.getenv("GPT4O_OUT_PRICE",       "0.03"))
-GPT4O_MINI_IN_PRICE   = float(os.getenv("GPT4O_MINI_IN_PRICE",   "0.002"))
-GPT4O_MINI_OUT_PRICE  = float(os.getenv("GPT4O_MINI_OUT_PRICE",  "0.006"))
+GPT4O_IN_PRICE        = float(os.getenv("GPT4O_IN_PRICE",        "0.01")) * 1000  # USD / 1k tok
+GPT4O_OUT_PRICE       = float(os.getenv("GPT4O_OUT_PRICE",       "0.03")) * 1000
+GPT4O_MINI_IN_PRICE   = float(os.getenv("GPT4O_MINI_IN_PRICE",   "0.002")) * 1000
+GPT4O_MINI_OUT_PRICE  = float(os.getenv("GPT4O_MINI_OUT_PRICE",  "0.006")) * 1000
 # ╰──────────────────────────────────────────────────────────────────────────╯
 PER_TOOL_TOKEN_EST    = int(os.getenv("PER_TOOL_TOKEN_EST",      "300"))
 DEFAULT_TOOLS_COUNT   = int(os.getenv("DEFAULT_TOOLS_COUNT",     "3"))

@@ -17,7 +17,7 @@ from app.payments_sdk.sdk import (
     PortalUpdateDeepLinkRequest,
     PortalCancelDeepLinkRequest,
     ResourcesState,
-    DynamicResource,
+    DynamicResource, ConsumeResourcesRequest, ResourceItem, ApiError,
 )
 
 
@@ -242,3 +242,58 @@ def _price_cache_get(plan_type: str, variant: str) -> Optional[str]:
 def _price_cache_put(plan_type: str, variant: str, price_id: str) -> None:
     _price_cache[(plan_type, variant)] = (price_id, time.time() + _PRICE_TTL_SEC)
 
+
+# ============================================================
+# C R E D I T S :  consumo prima dell’operazione
+# ============================================================
+import uuid
+
+async def _consume_credits_or_402(
+    token: str | None,
+    amount: float,
+    *,
+    reason: str,
+    expected_plan_type: str | None = None,
+    expected_variant: str | None = None,
+    subscription_id: str | None = None
+) -> None:
+    """
+    Consuma 'amount' crediti dall’utente; se fallisce -> HTTP 402/4xx.
+    NOTA: 'amount' è già in crediti (nessuna conversione USD->crediti).
+    """
+    if not token:
+        raise HTTPException(401, "Token richiesto per consumo crediti")
+
+    if amount is None or amount <= 0:
+        return  # nulla da consumare
+
+    t_1 = time.time()
+    client = _mk_plans_client(token)
+    t_2 = time.time()
+    sub_id = subscription_id or await _find_current_subscription_id(client)
+    t_3 = time.time()
+    if not sub_id:
+        raise HTTPException(404, "Nessuna subscription attiva trovata")
+
+    # Request id per debugging/idempotency lato log
+    req_id = str(uuid.uuid4())
+    body = ConsumeResourcesRequest(
+        items=[ResourceItem(key="credits", unit="credits", quantity=round(float(amount),0))],
+        reason=f"{reason} | req_id={req_id}",
+        expected_plan_type=expected_plan_type,
+        expected_variant=expected_variant,
+    )
+    try:
+        # Lo SDK del client è sincrono: usa wrapper _sdk (già presente)
+        t_4 = time.time()
+        await _sdk(client.consume_resources, sub_id, body)
+        t_5 = time.time()
+        print("#*" * 120)
+        print(t_2 - t_1, t_3 - t_2, t_4 - t_3, t_5 - t_4)
+        print("#*" * 120)
+    except ApiError as e:
+        # Propaga il payload originale del backend piani
+        raise HTTPException(
+            status_code=getattr(e, "status_code", 402),
+            detail=getattr(e, "payload", str(e))
+        )
