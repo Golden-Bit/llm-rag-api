@@ -379,6 +379,7 @@ class MePlansClient:
             json=(json_body if json_body is not None else None),
             timeout=timeout or self.default_timeout,
         )
+
         if resp.status_code >= 300:
             try:
                 payload = resp.json()

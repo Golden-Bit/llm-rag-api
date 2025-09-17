@@ -45,7 +45,7 @@ from app.utils.payments_utils import (_mk_plans_client, _find_current_subscripti
                                       _dataclass_to_dict,
                                       build_variants_for_intent, ChangeIntent, features_for_update, _sorted_variants,
                                       _variant_value, _cfg_key, _config_cache_get, _config_cache_put, _price_cache_put,
-                                      _price_cache_get, _consume_credits_or_402)
+                                      _price_cache_get, _consume_credits_or_402, PLANS_DEFAULT_PLAN_TYPE)
 app = FastAPI(
     root_path="/llm-rag"
 )
@@ -3245,6 +3245,8 @@ async def create_checkout_session_variant(body: CheckoutVariantIn):
     if REQUIRED_AUTH:
         verify_access_token(body.token, cognito_sdk)
 
+    print(body.model_dump_json())
+
     client = _mk_plans_client(body.token)
 
     # Blocchi usati sia per la UI del Portal che per il fingerprint della config
@@ -3286,7 +3288,12 @@ async def create_checkout_session_variant(body: CheckoutVariantIn):
     )
 
     try:
+
         out = await _sdk(client.create_checkout, req)
+
+        print("#*" * 12)
+        print(out)
+        print("#*" * 12)
 
         # [NEW] se L1 ha restituito la configuration_id e non era in cache, salvala
         try:
@@ -3337,8 +3344,36 @@ async def create_portal_session(body: PortalSessionIn):
 
     # 2) Stato corrente (usa hint se presente per evitare chiamate superflue)
     sub_id = getattr(body, "current_subscription_id", None) or await _find_current_subscription_id(client)
+
+
+    '''if not sub_id:
+        raise HTTPException(404, "Nessuna subscription attiva trovata")'''
+
     if not sub_id:
-        raise HTTPException(404, "Nessuna subscription attiva trovata")
+        # ▼ View-only: niente update piano, solo PM update & fatture
+        plan_type = getattr(body, "current_plan_type", None) or PLANS_DEFAULT_PLAN_TYPE
+        selector = PortalConfigSelector(
+            plan_type=plan_type,
+            # nessun preset/variants_override
+            features_override={
+                "payment_method_update": {"enabled": True},
+                "invoice_history": {"enabled": True},
+                "subscription_update": {"enabled": False},
+                "subscription_cancel": {"enabled": False},
+            },
+            business_profile_override={"headline": f"{plan_type} – Manage billing"},
+        )
+        req = PortalSessionRequest(
+            return_url=(body.return_url or RETURN_URL or PLANS_SUCCESS_URL_DEF),
+            portal=selector,
+            flow_data=None,
+        )
+        try:
+            sess = await _sdk(client.create_portal_session, req)
+            return {"portal_session_id": sess.id, "url": sess.url, "configuration_id": sess.configuration_id}
+        except ApiError as e:
+            raise HTTPException(status_code=getattr(e, "status_code", 500), detail=getattr(e, "payload", str(e)))
+
 
     plan_type = getattr(body, "current_plan_type", None)
     if not plan_type:

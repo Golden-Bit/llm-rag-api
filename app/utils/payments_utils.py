@@ -32,6 +32,8 @@ RETURN_URL = None
 # Stati subscription considerate “vive”
 ALIVE_SUB_STATUSES = {"trialing","active","past_due","unpaid","incomplete","paused","incomplete_expired"}
 
+PLANS_DEFAULT_PLAN_TYPE = os.getenv("PLANS_DEFAULT_PLAN_TYPE", "ai_standard")
+
 # Bucket varianti di catalogo che vuoi mostrare nel Portal/Deeplink (puoi adattarlo)
 # 👇 Catalogo ufficiale 6 varianti (label e prezzo in centesimi: EUR)
 VARIANTS_CATALOG: Dict[str, Dict[str, Any]] = {
