@@ -3352,7 +3352,7 @@ async def create_portal_session(body: PortalSessionIn):
     features = {
         "payment_method_update": {"enabled": True},
         "subscription_update": {"enabled": False},
-        "subscription_cancel": {"enabled": True, "mode": "at_period_end"},
+        "subscription_cancel": {"enabled": True, "mode": "immediately"},
         "invoice_history": {"enabled": True},
     }
     headline = f"{plan_type} – Manage billing"
