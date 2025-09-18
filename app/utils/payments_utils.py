@@ -269,11 +269,11 @@ async def _consume_credits_or_402(
     if amount is None or amount <= 0:
         return  # nulla da consumare
 
-    t_1 = time.time()
+
     client = _mk_plans_client(token)
-    t_2 = time.time()
+
     sub_id = subscription_id or await _find_current_subscription_id(client)
-    t_3 = time.time()
+
     if not sub_id:
         raise HTTPException(404, "Nessuna subscription attiva trovata")
 
@@ -287,12 +287,10 @@ async def _consume_credits_or_402(
     )
     try:
         # Lo SDK del client è sincrono: usa wrapper _sdk (già presente)
-        t_4 = time.time()
+
         await _sdk(client.consume_resources, sub_id, body)
-        t_5 = time.time()
-        print("#*" * 120)
-        print(t_2 - t_1, t_3 - t_2, t_4 - t_3, t_5 - t_4)
-        print("#*" * 120)
+
+
     except ApiError as e:
         # Propaga il payload originale del backend piani
         raise HTTPException(
