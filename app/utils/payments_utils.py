@@ -26,8 +26,8 @@ from app.payments_sdk.sdk import (
 PLANS_API_BASE         = os.getenv("PLANS_API_BASE", "http://localhost:8222").rstrip("/")
 PLANS_ADMIN_API_KEY    = os.getenv("PLANS_ADMIN_API_KEY", "adminkey123:admin")
 PLANS_STRIPE_ACCOUNT   = os.getenv("PLANS_STRIPE_ACCOUNT", None)
-PLANS_SUCCESS_URL_DEF  = os.getenv("PLANS_SUCCESS_URL", "https://tuo-sito.com/success?cs_id={CHECKOUT_SESSION_ID}")
-PLANS_CANCEL_URL_DEF   = os.getenv("PLANS_CANCEL_URL",  "https://tuo-sito.com/cancel")
+PLANS_SUCCESS_URL_DEF  = os.getenv("PLANS_SUCCESS_URL", "https://teatek-llm.theia-innovation.com/boxed-ai/success?cs_id={CHECKOUT_SESSION_ID}")
+PLANS_CANCEL_URL_DEF   = os.getenv("PLANS_CANCEL_URL",  "https://teatek-llm.theia-innovation.com/boxed-ai/cancel")
 RETURN_URL = None
 # Stati subscription considerate “vive”
 ALIVE_SUB_STATUSES = {"trialing","active","past_due","unpaid","incomplete","paused","incomplete_expired"}
