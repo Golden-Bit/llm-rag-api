@@ -2407,7 +2407,7 @@ async def loader_kwargs_schema():
                 "default": True,
                 "items": None,
                 "example": True,
-                "editable": False
+                "editable": True
             },
             "url": {
                 "name": "url",
@@ -2415,7 +2415,7 @@ async def loader_kwargs_schema():
                 "default": "http://34.13.153.241:8333/",
                 "items": None,
                 "example": "http://34.13.153.241:8333/",
-                "editable": False
+                "editable": True
             },
             "api_key": {
                 "name": "api_key",
@@ -2423,7 +2423,7 @@ async def loader_kwargs_schema():
                 "default": "metti-una-chiave-robusta", #"<set-in-env>",
                 "items": None,
                 "example": "metti-una-chiave-robusta",
-                "editable": False
+                "editable": True
             },
 
             # --- modalità di ritorno documenti dal loader ---
