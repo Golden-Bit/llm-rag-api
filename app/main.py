@@ -70,6 +70,39 @@ with open("config.json") as config_file:
 NLP_CORE_SERVICE = config["nlp_core_service"]
 openai_api_keys = config["openai_api_keys"]
 
+
+# --- HELPER: filename -> versioni normalizzate -------------------------------
+def _safe_filename(name: str) -> str:
+    # per mappe loader_*: gli spazi diventano underscore (come già facevi)
+    return name.replace(" ", "_")
+
+def _nospace_filename(name: str) -> str:
+    # per la collection legacy: gli spazi vengono rimossi
+    return name.replace(" ", "_")
+
+# --- HELPER: loader_id deterministico (15 char) ------------------------------
+def make_loader_id_from_kwargs(ctx: str, filename: str, effective_kwargs: Mapping) -> tuple[str, str]:
+    """
+    Ritorna (id_core, loader_id) dove:
+      id_core = short_hash({ctx, filename_safe, loader_kwargs}, length=15)
+      loader_id = f"{id_core}_loader"
+    Include *tutti* i campi dei kwargs (openai_api_key compresa).
+    """
+    payload = {
+        "ctx": ctx,
+        "filename": _safe_filename(filename),
+        "loader_kwargs": effective_kwargs,  # post-merge; contiene tutti i campi
+    }
+    id_core = short_hash(payload, length=15)
+    loader_id = f"{id_core}_loader"
+    return id_core, loader_id
+
+# --- HELPER: collection name legacy -----------------------------------------
+def make_legacy_collection_name(ctx: str, filename: str) -> str:
+    # esattamente come prima: ctx + filename con spazi rimossi + "_collection"
+    return f"{ctx}{_nospace_filename(filename)}_collection"
+
+
 # ------------------------------------------------------------------
 # Vector‑store IDs  ← hash(JSON(cfg))
 # ------------------------------------------------------------------
@@ -189,6 +222,8 @@ async def _wait_task_done(
     poll_secs: float = 5.0,
     max_wait: float = 1800.0,          # 30 min → scegli tu
 ):
+
+
     start = time.monotonic()
     while True:
         st = (await client.get(status_url)).json()
@@ -210,19 +245,22 @@ async def _wait_task_done(
 def _build_loader_config_payload(
     context: str,
     file: UploadFile,
-    collection_name: str,
-    loader_config_id: str,
+    collection_name: str | None,      # ignorato: usiamo naming legacy
+    loader_config_id: str | None,     # ignorato: calcoliamo noi da kwargs
     custom_loaders: Optional[Dict[str, str]] = None,
     custom_kwargs: Optional[Dict[str, Dict[str, Any]]] = None,
-) -> dict:
+) -> tuple[str, str, dict]:
     """
-    Crea il payload JSON per /document_loaders/configure_loader
-    basandosi sull'estensione del file e sulle convenzioni già in uso.
+    Crea il payload JSON per /document_loaders/configure_loader con:
+      • loader_id deterministico (hash 15) da {ctx, filename_norm, chosen_kwargs}
+      • coll_name legacy = f"{ctx}{filename_senza_spazi}_collection"
+    Ritorna: (loader_id, coll_name, payload)
     """
     file_type = file.filename.split(".")[-1].lower()
+    safe_name = _safe_filename(file.filename)
 
-    # mappa estensione → loader
-    loaders = {
+    # mappa estensione → loader (base)
+    base_loaders = {
         "png": "ImageDescriptionLoader",
         "jpg": "ImageDescriptionLoader",
         "jpeg": "ImageDescriptionLoader",
@@ -233,72 +271,38 @@ def _build_loader_config_payload(
         "default": "UnstructuredLoader",
     }
 
-    # kwargs specifici per ciascun loader (resize, API-key, ecc.)
-    kwargs = {
-        # immagini
-        "png": {
-            "openai_api_key": get_random_openai_api_key(),
-            "resize_to": (256, 256),
-        },
-        "jpg": {
-            "openai_api_key": get_random_openai_api_key(),
-            "resize_to": (256, 256),
-        },
-        "jpeg": {
-            "openai_api_key": get_random_openai_api_key(),
-            "resize_to": (256, 256),
-        },
-        # video
-        "avi": {
-            "resize_to": [256, 256],
-            "num_frames": 10,
-            "openai_api_key": get_random_openai_api_key(),
-        },
-        "mp4": {
-            "resize_to": [256, 256],
-            "num_frames": 10,
-            "openai_api_key": get_random_openai_api_key(),
-        },
-        "mov": {
-            "resize_to": [256, 256],
-            "num_frames": 10,
-            "openai_api_key": get_random_openai_api_key(),
-        },
-        "mkv": {
-            "resize_to": [256, 256],
-            "num_frames": 10,
-            "openai_api_key": get_random_openai_api_key(),
-        },
-        # fallback
-        "default": {
-            "strategy": "hi_res",
-            "partition_via_api": False,
-        },
+    # kwargs specifici per ciascun loader (base)
+    base_kwargs = {
+        "png":  {"openai_api_key": get_random_openai_api_key(), "resize_to": (256, 256)},
+        "jpg":  {"openai_api_key": get_random_openai_api_key(), "resize_to": (256, 256)},
+        "jpeg": {"openai_api_key": get_random_openai_api_key(), "resize_to": (256, 256)},
+        "avi":  {"resize_to": [256, 256], "num_frames": 10, "openai_api_key": get_random_openai_api_key()},
+        "mp4":  {"resize_to": [256, 256], "num_frames": 10, "openai_api_key": get_random_openai_api_key()},
+        "mov":  {"resize_to": [256, 256], "num_frames": 10, "openai_api_key": get_random_openai_api_key()},
+        "mkv":  {"resize_to": [256, 256], "num_frames": 10, "openai_api_key": get_random_openai_api_key()},
+        "default": {"strategy": "hi_res", "partition_via_api": False},
     }
 
-    custom_loaders = custom_loaders if custom_loaders else {}
-    custom_kwargs = custom_kwargs if custom_kwargs else {}
-
-    #loaders.update(custom_loaders)
-    #kwargs.update(custom_kwargs)
-
     # merge profondo con eventuali override
-    loaders      = deep_merge(loaders, custom_loaders or {})
-    kwargs       = deep_merge(kwargs,  custom_kwargs or {})
+    eff_loaders = deep_merge(base_loaders, custom_loaders or {})
+    eff_kwargs  = deep_merge(base_kwargs,  custom_kwargs  or {})
 
-    # loader e kwargs selezionati
-    chosen_loader = loaders.get(file_type, loaders["default"])
-    chosen_kwargs = kwargs.get(file_type, kwargs["default"])
+    # selezione finale
+    chosen_loader = eff_loaders.get(file_type, eff_loaders["default"])
+    chosen_kwargs = eff_kwargs.get(file_type, eff_kwargs["default"])
 
-    # payload conforme all’endpoint configure_loader
-    return {
-        "config_id": loader_config_id,
+    # === ID loader deterministico (15 char) ===
+    _, computed_loader_id = make_loader_id_from_kwargs(context, file.filename, chosen_kwargs)
+
+    # === Collection name LEGACY (come prima) ===
+    computed_coll_name = make_legacy_collection_name(context, file.filename)
+
+    payload = {
+        "config_id": computed_loader_id,
         "path": f"data_stores/data/{context}",
-        "loader_map": {file.filename.replace(" ", "_"): chosen_loader},
-        "loader_kwargs_map": {file.filename.replace(" ", "_"): chosen_kwargs},
-        "metadata_map": {
-            file.filename.replace(" ", "_"): {"source_context": context}
-        },
+        "loader_map": {safe_name: chosen_loader},
+        "loader_kwargs_map": {safe_name: chosen_kwargs},
+        "metadata_map": {safe_name: {"source_context": context}},
         "default_metadata": {"source_context": context},
         "recursive": True,
         "max_depth": 5,
@@ -311,11 +315,12 @@ def _build_loader_config_payload(
         "sample_size": 10,
         "randomize_sample": True,
         "sample_seed": 42,
-        "output_store_map": {
-            file.filename.replace(" ", "_"): {"collection_name": collection_name}
-        },
-        "default_output_store": {"collection_name": collection_name},
+        "output_store_map": {safe_name: {"collection_name": computed_coll_name}},
+        "default_output_store": {"collection_name": computed_coll_name},
     }
+
+    return computed_loader_id, computed_coll_name, payload
+
 
 
 async def _ensure_vector_store(
@@ -375,6 +380,92 @@ async def _ensure_vector_store(
     return vector_store_config_id, vector_store_id
 
 
+'''async def _process_context_pipeline(
+    ctx: str,
+    file: UploadFile,
+    file_content: bytes,
+    file_uuid: str,
+    file_metadata: dict,
+    loader_task_id: str,
+    vector_task_id: str,
+    client: httpx.AsyncClient,
+    loaders: Optional[Dict[str, str]] = None,
+    loader_kwargs: Optional[Dict[str, Dict[str, Any]]] = None,
+):
+    """
+    Esegue TUTTE le operazioni “pesanti” per un singolo context:
+        0. upload raw file
+        1. config loader  + load_documents_async (attesa DONE)
+        2. config vector store (idempotente)      + add_docs_async
+    Tutte le chiamate sono già non-bloccanti vs l'utente; qui le orchestriamo.
+    """
+    # ---------- 0. upload file --------------------------------------------------
+    data = {
+        "subdir": ctx,
+        "extra_metadata": json.dumps({"file_uuid": file_uuid, **file_metadata})
+    }
+    files = {"file": (file.filename.replace(" ", "_"), file_content, file.content_type)}
+    await _post_or_400(client, f"{NLP_CORE_SERVICE}/data_stores/upload", data=data, files=files)
+
+    # ---------- 1. prepare loader ----------------------------------------------
+    # Calcolo deterministico degli ID (15 char) a partire da ctx, filename e *chosen* loader_kwargs.
+    # NB: la funzione aggiornata restituisce: (loader_id, coll_name, payload)
+    loader_id, coll_name, loader_payload = _build_loader_config_payload(
+        ctx,
+        file,
+        collection_name=None,           # calcolata internamente
+        loader_config_id=None,          # calcolato internamente
+        custom_loaders=loaders,
+        custom_kwargs=loader_kwargs,
+    )
+
+    print("#" * 120)
+    print(loaders)
+    print(loader_kwargs)
+    print(json.dumps(loader_payload, indent=4))
+    print("#" * 120)
+
+    await _post_or_400(
+        client,
+        f"{NLP_CORE_SERVICE}/document_loaders/configure_loader",
+        json=loader_payload
+    )
+
+    # lancia il loader in async e aspetta che finisca
+    STEP_1 = await _post_or_400(
+        client,
+        f"{NLP_CORE_SERVICE}/document_loaders/load_documents_async/{loader_id}",
+        data={"task_id": loader_task_id},
+    )
+    print("#"*120)
+    print(STEP_1)
+    print("#" * 120)
+
+    WAIT_1 = await _wait_task_done(client, f"{NLP_CORE_SERVICE}/document_loaders/task_status/{loader_task_id}")
+
+    print("#"*120)
+    print(WAIT_1)
+    print("#" * 120)
+
+    # ---------- 2. config / load vector store ----------------------------------
+    _, vect_id = await _ensure_vector_store(ctx, client)  # idempotente
+
+    STEP_2 = await _post_or_400(
+        client,
+        f"{NLP_CORE_SERVICE}/vector_stores/vector_store/add_documents_from_store_async/{vect_id}",
+        params={"document_collection": coll_name, "task_id": vector_task_id},
+    )
+    print("#"*120)
+    print(STEP_2)
+    print("#" * 120)
+    WAIT_2 = await _wait_task_done(
+        client,
+        f"{NLP_CORE_SERVICE}/vector_stores/vector_store/task_status/{vector_task_id}"
+    )
+    print("#"*120)
+    print(WAIT_2)
+    print("#" * 120)'''
+
 async def _process_context_pipeline(
     ctx: str,
     file: UploadFile,
@@ -399,17 +490,16 @@ async def _process_context_pipeline(
         "subdir": ctx,
         "extra_metadata": json.dumps({"file_uuid": file_uuid, **file_metadata})
     }
-    files = {"file": (file.filename.replace(" ", "_"), file_content, file.content_type)}
+    files = {"file": (_safe_filename(file.filename), file_content, file.content_type)}
     await _post_or_400(client, f"{NLP_CORE_SERVICE}/data_stores/upload", data=data, files=files)
 
     # ---------- 1. prepare loader ----------------------------------------------
-    loader_id       = f"{ctx}{file.filename.replace(' ', '')}_loader"
-    coll_name       = f"{ctx}{file.filename.replace(' ', '')}_collection"
-    loader_payload  = _build_loader_config_payload(
+    # Calcolo deterministico del loader_id; collection name LEGACY (come prima)
+    loader_id, coll_name, loader_payload = _build_loader_config_payload(
         ctx,
         file,
-        coll_name,
-        loader_id,
+        collection_name=None,           # ignorato (legacy inside)
+        loader_config_id=None,          # ignorato (hash inside)
         custom_loaders=loaders,
         custom_kwargs=loader_kwargs,
     )
@@ -417,32 +507,49 @@ async def _process_context_pipeline(
     print("#"*120)
     print(loaders)
     print(loader_kwargs)
-
     print(json.dumps(loader_payload, indent=4))
+    print("#"*120)
 
-    await _post_or_400(client, f"{NLP_CORE_SERVICE}/document_loaders/configure_loader", json=loader_payload)
+    await _post_or_400(
+        client,
+        f"{NLP_CORE_SERVICE}/document_loaders/configure_loader",
+        json=loader_payload
+    )
 
     # lancia il loader in async e aspetta che finisca
-    await _post_or_400(
+    STEP_1 = await _post_or_400(
         client,
         f"{NLP_CORE_SERVICE}/document_loaders/load_documents_async/{loader_id}",
         data={"task_id": loader_task_id},
     )
-    await _wait_task_done(client, f"{NLP_CORE_SERVICE}/document_loaders/task_status/{loader_task_id}")
+    print("#"*120)
+    print(STEP_1)
+    print("#" * 120)
+
+    WAIT_1 = await _wait_task_done(client, f"{NLP_CORE_SERVICE}/document_loaders/task_status/{loader_task_id}")
+
+    print("#"*120)
+    print(WAIT_1)
+    print("#" * 120)
 
     # ---------- 2. config / load vector store ----------------------------------
     _, vect_id = await _ensure_vector_store(ctx, client)  # idempotente
 
-    await _post_or_400(
+    STEP_2 = await _post_or_400(
         client,
         f"{NLP_CORE_SERVICE}/vector_stores/vector_store/add_documents_from_store_async/{vect_id}",
         params={"document_collection": coll_name, "task_id": vector_task_id},
     )
-
-    await _wait_task_done(
+    print("#"*120)
+    print(STEP_2)
+    print("#" * 120)
+    WAIT_2 = await _wait_task_done(
         client,
         f"{NLP_CORE_SERVICE}/vector_stores/vector_store/task_status/{vector_task_id}"
     )
+    print("#"*120)
+    print(WAIT_2)
+    print("#" * 120)
 
 
 # --------------------------- REWRITE *ENTIRE* helper ---------------------------
@@ -2164,10 +2271,10 @@ async def loaders_catalog():
         "png":  ["ImageDescriptionLoader"],
         "jpg":  ["ImageDescriptionLoader"],
         "jpeg": ["ImageDescriptionLoader"],
-        "avi":  ["VideoDescriptionLoader"],
+        "avi":  ["VideoDescriptionLoader", "VideoEventDetectionLoader"],
         "mp4":  ["VideoDescriptionLoader", "VideoEventDetectionLoader"],
-        "mov":  ["VideoDescriptionLoader"],
-        "mkv":  ["VideoDescriptionLoader"],
+        "mov":  ["VideoDescriptionLoader", "VideoEventDetectionLoader"],
+        "mkv":  ["VideoDescriptionLoader", "VideoEventDetectionLoader"],
         "default": ["UnstructuredLoader"]
     }
 
@@ -2293,6 +2400,226 @@ async def loader_kwargs_schema():
             }
         },
         "UnstructuredLoader": {
+            # --- instradamento verso API self-hosted ---
+            "partition_via_api": {
+                "name": "partition_via_api",
+                "type": "boolean",
+                "default": True,
+                "items": None,
+                "example": True,
+                "editable": True
+            },
+            "url": {
+                "name": "url",
+                "type": "string",
+                "default": "http://34.13.153.241:8333/",
+                "items": None,
+                "example": "http://34.13.153.241:8333/",
+                "editable": True
+            },
+            "api_key": {
+                "name": "api_key",
+                "type": "string",
+                "default": "metti-una-chiave-robusta", #"<set-in-env>",
+                "items": None,
+                "example": "metti-una-chiave-robusta",
+                "editable": True
+            },
+
+            # --- modalità di ritorno documenti dal loader ---
+            "mode": {
+                "name": "mode",
+                "type": "string",
+                "default": "elements",
+                "items": ["single", "elements", "paged"],
+                "example": "elements"
+            },
+
+            # --- strategia / modello / formato ---
+            "strategy": {
+                "name": "strategy",
+                "type": "string",
+                "default": "auto",
+                "items": ["auto", "fast", "hi_res", "ocr_only"],
+                "example": "hi_res"
+            },
+            "hi_res_model_name": {
+                "name": "hi_res_model_name",
+                "type": "string",
+                "default": "yolox",
+                "items": ["yolox", "detectron2_onnx"],
+                "example": "yolox"
+            },
+            "output_format": {
+                "name": "output_format",
+                "type": "string",
+                "default": "application/json",
+                "items": ["application/json", "text/csv"],
+                "example": "application/json"
+            },
+
+            # --- OCR / lingue / encoding ---
+            "ocr_languages": {
+                "name": "ocr_languages",
+                "type": "list[string]",
+                "default": ["ita", "eng"],
+                "items": None,
+                "example": ["ita", "eng"]
+            },
+            "languages": {
+                "name": "languages",
+                "type": "list[string]",
+                "default": ["it", "en"],
+                "items": None,
+                "example": ["it", "en"]
+            },
+            "encoding": {
+                "name": "encoding",
+                "type": "string",
+                "default": "utf-8",
+                "items": None,
+                "example": "utf-8"
+            },
+
+            # --- layout / coordinate / pagine / slide ---
+            "coordinates": {
+                "name": "coordinates",
+                "type": "boolean",
+                "default": False,
+                "items": None,
+                "example": True
+            },
+            "include_page_breaks": {
+                "name": "include_page_breaks",
+                "type": "boolean",
+                "default": False,
+                "items": None,
+                "example": True
+            },
+            "starting_page_number": {
+                "name": "starting_page_number",
+                "type": "integer",
+                "default": 1,
+                "items": None,
+                "example": 1
+            },
+            "include_slide_notes": {
+                "name": "include_slide_notes",
+                "type": "boolean",
+                "default": True,
+                "items": None,
+                "example": True
+            },
+
+            # --- tabelle PDF / XML ---
+            "pdf_infer_table_structure": {
+                "name": "pdf_infer_table_structure",
+                "type": "boolean",
+                "default": True,
+                "items": None,
+                "example": True
+            },
+            "skip_infer_table_types": {
+                "name": "skip_infer_table_types",
+                "type": "list[string]",
+                "default": [],
+                "items": None,
+                "example": ["pdf"]
+            },
+            "xml_keep_tags": {
+                "name": "xml_keep_tags",
+                "type": "boolean",
+                "default": False,
+                "items": None,
+                "example": False
+            },
+
+            # --- immagini estratte (opzionale, dipende dalla tua pipeline) ---
+            "extract_image_block_types": {
+                "name": "extract_image_block_types",
+                "type": "list[string]",
+                "default": [],
+                "items": None,
+                "example": ["table", "figure"]
+            },
+            "unique_element_ids": {
+                "name": "unique_element_ids",
+                "type": "boolean",
+                "default": True,
+                "items": None,
+                "example": True
+            },
+
+            # --- chunking lato Unstructured ---
+            "chunking_strategy": {
+                "name": "chunking_strategy",
+                "type": "string",
+                "default": "basic",
+                "items": ["basic", "by_title"],
+                "example": "by_title"
+            },
+            "combine_under_n_chars": {
+                "name": "combine_under_n_chars",
+                "type": "integer",
+                "default": 2000,
+                "items": None,
+                "example": 2000
+            },
+            "max_characters": {
+                "name": "max_characters",
+                "type": "integer",
+                "default": 4000,
+                "items": None,
+                "example": 4000
+            },
+            "multipage_sections": {
+                "name": "multipage_sections",
+                "type": "boolean",
+                "default": True,
+                "items": None,
+                "example": True
+            },
+            "new_after_n_chars": {
+                "name": "new_after_n_chars",
+                "type": "integer",
+                "default": None,
+                "items": None,
+                "example": 1500
+            },
+            "overlap": {
+                "name": "overlap",
+                "type": "integer",
+                "default": 200,
+                "items": None,
+                "example": 200
+            },
+            "overlap_all": {
+                "name": "overlap_all",
+                "type": "boolean",
+                "default": False,
+                "items": None,
+                "example": False
+            },
+
+            # --- lato client HTTP (opzionale) ---
+            "request_timeout_seconds": {
+                "name": "request_timeout_seconds",
+                "type": "integer",
+                "default": 180,
+                "items": None,
+                "example": 300
+            },
+            "retries": {
+                "name": "retries",
+                "type": "integer",
+                "default": 2,
+                "items": None,
+                "example": 3
+            }
+        }
+    }
+
+'''"UnstructuredLoader": {
   "mode": {
     "name": "mode",
     "type": "string",
@@ -2360,8 +2687,7 @@ async def loader_kwargs_schema():
                 #"description": "Se true forza l’uso del Partition Endpoint remoto invece del parsing locale."
             },
 }
-
-    }
+    }'''
 
 
 
