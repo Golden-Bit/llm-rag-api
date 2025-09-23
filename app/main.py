@@ -2554,7 +2554,7 @@ async def loader_kwargs_schema():
             "chunking_strategy": {
                 "name": "chunking_strategy",
                 "type": "string",
-                "default": "basic",
+                "default": "by_title",
                 "items": ["basic", "by_title"],
                 "example": "by_title"
             },
