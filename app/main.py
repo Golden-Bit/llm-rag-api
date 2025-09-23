@@ -2407,7 +2407,7 @@ async def loader_kwargs_schema():
                 "default": True,
                 "items": None,
                 "example": True,
-                "editable": True
+                "editable": False
             },
             "url": {
                 "name": "url",
@@ -2415,7 +2415,7 @@ async def loader_kwargs_schema():
                 "default": "http://34.13.153.241:8333/",
                 "items": None,
                 "example": "http://34.13.153.241:8333/",
-                "editable": True
+                "editable": False
             },
             "api_key": {
                 "name": "api_key",
@@ -2423,14 +2423,14 @@ async def loader_kwargs_schema():
                 "default": "metti-una-chiave-robusta", #"<set-in-env>",
                 "items": None,
                 "example": "metti-una-chiave-robusta",
-                "editable": True
+                "editable": False
             },
 
             # --- modalità di ritorno documenti dal loader ---
             "mode": {
                 "name": "mode",
                 "type": "string",
-                "default": "elements",
+                "default": "paged",
                 "items": ["single", "elements", "paged"],
                 "example": "elements"
             },
@@ -2439,8 +2439,8 @@ async def loader_kwargs_schema():
             "strategy": {
                 "name": "strategy",
                 "type": "string",
-                "default": "auto",
-                "items": ["auto", "fast", "hi_res", "ocr_only"],
+                "default": "hi_res",
+                "items": ["fast", "hi_res", "ocr_only"], #"auto"
                 "example": "hi_res"
             },
             "hi_res_model_name": {
