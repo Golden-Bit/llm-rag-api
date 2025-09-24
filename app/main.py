@@ -101,6 +101,7 @@ def _sanitize_filename(name: str) -> str:
 
     stem = stem.replace(" ", "_").replace("\t", "_")
     stem = re.sub(r"\s+", "_", stem)
+    stem = re.sub(r"_+", "_", stem)
 
     # normalizza accenti su stem ed estensione
     stem   = _strip_accents(stem)
