@@ -21,6 +21,9 @@ from PIL import Image, TiffImagePlugin
 import tempfile
 import os, math, json
 import httpx
+import re
+import unicodedata
+from pathlib import Path
 from typing import Literal, Optional, Dict, Any, Union, Annotated
 from pydantic import BaseModel, Field
 from app.auth_sdk.sdk import CognitoSDK, AccessTokenRequest
@@ -72,13 +75,57 @@ openai_api_keys = config["openai_api_keys"]
 
 
 # --- HELPER: filename -> versioni normalizzate -------------------------------
+# --- HELPER: filename sanitizzato (accenti → non accentati; consentiti: A-Za-z0-9 , _ - .) ---
+
+
+_ALLOWED_CHARS_RE = re.compile(r"[^A-Za-z0-9_-]")
+
+def _strip_accents(s: str) -> str:
+    # rimuove i segni diacritici (es. "è" -> "e", "à" -> "a")
+    return "".join(ch for ch in unicodedata.normalize("NFKD", s) if not unicodedata.combining(ch))
+
+def _sanitize_filename(name: str) -> str:
+    """
+    - Sostituisce lettere accentate con equivalenti non accentate
+    - Elimina tutto ciò che NON è in [A-Za-z0-9,._-]
+    - Mantiene le estensioni (anche multiple, es. .tar.gz)
+    - Evita nomi vuoti: fallback a 'file'
+    """
+    if not isinstance(name, str):
+        name = str(name)
+
+    # separa stem ed eventuali estensioni (anche multiple)
+    p = Path(name)
+    suffix = "".join(p.suffixes)  # es. ".tar.gz"
+    stem   = p.name[:-len(suffix)] if suffix else p.name
+
+    stem = stem.replace(" ", "_").replace("\t", "_")
+    stem = re.sub(r"\s+", "_", stem)
+
+    # normalizza accenti su stem ed estensione
+    stem   = _strip_accents(stem)
+    #suffix = _strip_accents(suffix)
+
+    # rimuovi caratteri non consentiti
+    stem   = _ALLOWED_CHARS_RE.sub("", stem)
+    # per l'estensione ammettiamo solo lettere/numeri e punti
+    #suffix = re.sub(r"[^A-Za-z0-9.]", "", suffix)
+
+    # pulizia bordi (evita nomi tipo "._-,")
+    #stem = stem.strip(".,_-")
+
+    if not stem:
+        stem = "file"
+
+    return f"{stem}{suffix}"
+
+# retro-compat: manteniamo i nomi delle vecchie funzioni ma facciamole puntare al nuovo sanitizzatore
 def _safe_filename(name: str) -> str:
-    # per mappe loader_*: gli spazi diventano underscore (come già facevi)
-    return name.replace(" ", "_")
+    return _sanitize_filename(name)
 
 def _nospace_filename(name: str) -> str:
-    # per la collection legacy: gli spazi vengono rimossi
-    return name.replace(" ", "_")
+    return _sanitize_filename(name)
+
 
 # --- HELPER: loader_id deterministico (15 char) ------------------------------
 def make_loader_id_from_kwargs(ctx: str, filename: str, effective_kwargs: Mapping) -> tuple[str, str]:
@@ -133,6 +180,29 @@ def deep_merge(base: Mapping, override: Mapping) -> dict:
             result[key] = copy.deepcopy(val)
     return dict(result)
 
+# --- GENERATORI ID BASATI SU HASH -------------------------------------------
+def make_name_hash(*parts: str, suffix: str, length: int = 15) -> str:
+    """
+    Crea un identificatore sicuro:
+      id = short_hash("|".join(parts), length) + suffix
+    - Non trasforma i 'parts' (niente replace/strip)
+    - Usare per collection, loader, ecc.
+    """
+    key = "|".join(str(p) for p in parts)
+    return f"{short_hash(key, length=length)}{suffix}"
+
+def make_collection_name(ctx: str, filename: str, length: int = 15) -> str:
+    """Esempio specifico per Document Store collection."""
+    return make_name_hash(ctx, filename, suffix="_collection", length=length)
+
+def make_loader_id(ctx: str, filename: str, chosen_kwargs: Mapping, length: int = 15) -> str:
+    """
+    Loader ID deterministico che include anche i kwargs effettivi (openai_api_key compresa).
+    NB: lascia invariati ctx/filename (niente normalizzazioni).
+    """
+    payload = {"ctx": ctx, "filename": filename, "loader_kwargs": chosen_kwargs}
+    return f"{short_hash(payload, length=length)}_loader"
+
 
 def short_hash(obj: dict | str, length: int = 9) -> str:
     """
@@ -142,6 +212,13 @@ def short_hash(obj: dict | str, length: int = 9) -> str:
     if not isinstance(obj, str):
         obj = json.dumps(obj, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(obj.encode("utf-8")).hexdigest()[:length]
+
+# --- NEW: hash-based collection name (15) ------------------------------------
+import unicodedata
+
+def _nfc(s: str) -> str:
+    return unicodedata.normalize("NFC", s)
+
 
 # Models for handling requests and responses
 class ContextMetadata(BaseModel):
@@ -245,21 +322,17 @@ async def _wait_task_done(
 def _build_loader_config_payload(
     context: str,
     file: UploadFile,
-    collection_name: str | None,      # ignorato: usiamo naming legacy
-    loader_config_id: str | None,     # ignorato: calcoliamo noi da kwargs
+    collection_name: str | None,      # ignorato
+    loader_config_id: str | None,     # ignorato
     custom_loaders: Optional[Dict[str, str]] = None,
     custom_kwargs: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> tuple[str, str, dict]:
-    """
-    Crea il payload JSON per /document_loaders/configure_loader con:
-      • loader_id deterministico (hash 15) da {ctx, filename_norm, chosen_kwargs}
-      • coll_name legacy = f"{ctx}{filename_senza_spazi}_collection"
-    Ritorna: (loader_id, coll_name, payload)
-    """
-    file_type = file.filename.split(".")[-1].lower()
-    safe_name = _safe_filename(file.filename)
 
-    # mappa estensione → loader (base)
+    file_type = file.filename.split(".")[-1].lower()
+    # NB: safe_name SOLO per le mappe del payload (chiave "file" lato core).
+    #     NON influenza gli ID (che usano filename "puro" per l'hash).
+    safe_name = file.filename.replace(" ", "_")
+
     base_loaders = {
         "png": "ImageDescriptionLoader",
         "jpg": "ImageDescriptionLoader",
@@ -270,8 +343,6 @@ def _build_loader_config_payload(
         "mkv": "VideoDescriptionLoader",
         "default": "UnstructuredLoader",
     }
-
-    # kwargs specifici per ciascun loader (base)
     base_kwargs = {
         "png":  {"openai_api_key": get_random_openai_api_key(), "resize_to": (256, 256)},
         "jpg":  {"openai_api_key": get_random_openai_api_key(), "resize_to": (256, 256)},
@@ -283,26 +354,22 @@ def _build_loader_config_payload(
         "default": {"strategy": "hi_res", "partition_via_api": False},
     }
 
-    # merge profondo con eventuali override
     eff_loaders = deep_merge(base_loaders, custom_loaders or {})
     eff_kwargs  = deep_merge(base_kwargs,  custom_kwargs  or {})
 
-    # selezione finale
-    chosen_loader = eff_loaders.get(file_type, eff_loaders["default"])
-    chosen_kwargs = eff_kwargs.get(file_type, eff_kwargs["default"])
+    chosen_loader  = eff_loaders.get(file_type, eff_loaders["default"])
+    chosen_kwargs  = eff_kwargs.get(file_type,  eff_kwargs["default"])
 
-    # === ID loader deterministico (15 char) ===
-    _, computed_loader_id = make_loader_id_from_kwargs(context, file.filename, chosen_kwargs)
-
-    # === Collection name LEGACY (come prima) ===
-    computed_coll_name = make_legacy_collection_name(context, file.filename)
+    # === ID deterministici ===
+    computed_loader_id = make_loader_id(context, safe_name, chosen_kwargs, length=15)
+    computed_coll_name = make_collection_name(context, safe_name, length=15)
 
     payload = {
         "config_id": computed_loader_id,
         "path": f"data_stores/data/{context}",
-        "loader_map": {safe_name: chosen_loader},
+        "loader_map":        {safe_name: chosen_loader},
         "loader_kwargs_map": {safe_name: chosen_kwargs},
-        "metadata_map": {safe_name: {"source_context": context}},
+        "metadata_map":      {safe_name: {"source_context": context}},
         "default_metadata": {"source_context": context},
         "recursive": True,
         "max_depth": 5,
@@ -315,11 +382,12 @@ def _build_loader_config_payload(
         "sample_size": 10,
         "randomize_sample": True,
         "sample_seed": 42,
-        "output_store_map": {safe_name: {"collection_name": computed_coll_name}},
+        "output_store_map":   {safe_name: {"collection_name": computed_coll_name}},
         "default_output_store": {"collection_name": computed_coll_name},
     }
 
     return computed_loader_id, computed_coll_name, payload
+
 
 
 
@@ -332,19 +400,7 @@ async def _ensure_vector_store(
     - lo carica in memoria (endpoint /load)
     - restituisce (vector_store_config_id, vector_store_id)
     """
-    '''vector_store_config_id = f"{context}_vector_store_config"
-    vector_store_id        = f"{context}_vector_store"
 
-    vector_store_config = {
-        "config_id": vector_store_config_id,
-        "store_id": vector_store_id,
-        "vector_store_class": "Chroma",
-        "params": {"persist_directory": f"vector_stores/{context}"},
-        "embeddings_model_class": "OpenAIEmbeddings",
-        "embeddings_params": {"api_key": get_random_openai_api_key()},
-        "description": f"Vector store for context {context}",
-        "custom_metadata": {"source_context": context},
-    }'''
     base_cfg = {  # ← solo la “sostanza”
                 "vector_store_class": "Chroma",
                 "params": {"persist_directory": f"vector_stores/{context}"},
@@ -380,92 +436,6 @@ async def _ensure_vector_store(
     return vector_store_config_id, vector_store_id
 
 
-'''async def _process_context_pipeline(
-    ctx: str,
-    file: UploadFile,
-    file_content: bytes,
-    file_uuid: str,
-    file_metadata: dict,
-    loader_task_id: str,
-    vector_task_id: str,
-    client: httpx.AsyncClient,
-    loaders: Optional[Dict[str, str]] = None,
-    loader_kwargs: Optional[Dict[str, Dict[str, Any]]] = None,
-):
-    """
-    Esegue TUTTE le operazioni “pesanti” per un singolo context:
-        0. upload raw file
-        1. config loader  + load_documents_async (attesa DONE)
-        2. config vector store (idempotente)      + add_docs_async
-    Tutte le chiamate sono già non-bloccanti vs l'utente; qui le orchestriamo.
-    """
-    # ---------- 0. upload file --------------------------------------------------
-    data = {
-        "subdir": ctx,
-        "extra_metadata": json.dumps({"file_uuid": file_uuid, **file_metadata})
-    }
-    files = {"file": (file.filename.replace(" ", "_"), file_content, file.content_type)}
-    await _post_or_400(client, f"{NLP_CORE_SERVICE}/data_stores/upload", data=data, files=files)
-
-    # ---------- 1. prepare loader ----------------------------------------------
-    # Calcolo deterministico degli ID (15 char) a partire da ctx, filename e *chosen* loader_kwargs.
-    # NB: la funzione aggiornata restituisce: (loader_id, coll_name, payload)
-    loader_id, coll_name, loader_payload = _build_loader_config_payload(
-        ctx,
-        file,
-        collection_name=None,           # calcolata internamente
-        loader_config_id=None,          # calcolato internamente
-        custom_loaders=loaders,
-        custom_kwargs=loader_kwargs,
-    )
-
-    print("#" * 120)
-    print(loaders)
-    print(loader_kwargs)
-    print(json.dumps(loader_payload, indent=4))
-    print("#" * 120)
-
-    await _post_or_400(
-        client,
-        f"{NLP_CORE_SERVICE}/document_loaders/configure_loader",
-        json=loader_payload
-    )
-
-    # lancia il loader in async e aspetta che finisca
-    STEP_1 = await _post_or_400(
-        client,
-        f"{NLP_CORE_SERVICE}/document_loaders/load_documents_async/{loader_id}",
-        data={"task_id": loader_task_id},
-    )
-    print("#"*120)
-    print(STEP_1)
-    print("#" * 120)
-
-    WAIT_1 = await _wait_task_done(client, f"{NLP_CORE_SERVICE}/document_loaders/task_status/{loader_task_id}")
-
-    print("#"*120)
-    print(WAIT_1)
-    print("#" * 120)
-
-    # ---------- 2. config / load vector store ----------------------------------
-    _, vect_id = await _ensure_vector_store(ctx, client)  # idempotente
-
-    STEP_2 = await _post_or_400(
-        client,
-        f"{NLP_CORE_SERVICE}/vector_stores/vector_store/add_documents_from_store_async/{vect_id}",
-        params={"document_collection": coll_name, "task_id": vector_task_id},
-    )
-    print("#"*120)
-    print(STEP_2)
-    print("#" * 120)
-    WAIT_2 = await _wait_task_done(
-        client,
-        f"{NLP_CORE_SERVICE}/vector_stores/vector_store/task_status/{vector_task_id}"
-    )
-    print("#"*120)
-    print(WAIT_2)
-    print("#" * 120)'''
-
 async def _process_context_pipeline(
     ctx: str,
     file: UploadFile,
@@ -485,12 +455,16 @@ async def _process_context_pipeline(
         2. config vector store (idempotente)      + add_docs_async
     Tutte le chiamate sono già non-bloccanti vs l'utente; qui le orchestriamo.
     """
+
     # ---------- 0. upload file --------------------------------------------------
     data  = {
         "subdir": ctx,
         "extra_metadata": json.dumps({"file_uuid": file_uuid, **file_metadata})
     }
-    files = {"file": (_safe_filename(file.filename), file_content, file.content_type)}
+
+    file.filename = _safe_filename(file.filename)
+
+    files = {"file": (file.filename, file_content, file.content_type)}
     await _post_or_400(client, f"{NLP_CORE_SERVICE}/data_stores/upload", data=data, files=files)
 
     # ---------- 1. prepare loader ----------------------------------------------
@@ -505,6 +479,7 @@ async def _process_context_pipeline(
     )
 
     print("#"*120)
+    print(file.filename)
     print(loaders)
     print(loader_kwargs)
     print(json.dumps(loader_payload, indent=4))
@@ -1999,6 +1974,7 @@ async def list_documents_proxy(
     limit: int = Query(10, ge=1, description="Maximum number of documents to return."),
     token: str = Query(None, description="Access Token")
 ):
+
     """
     Re-instrada la richiesta verso l’endpoint originale
     `GET /document_stores/documents/{collection_name}/
@@ -2024,6 +2000,46 @@ async def list_documents_proxy(
     # la risposta dell’API originale è già nel formato atteso da DocumentModel
     return resp.json()
 
+@app.get("/documents", response_model=List[Dict[str, Any]])
+async def list_documents_proxy_resolved(
+    collection_name: Optional[str] = Query(
+        None, description="Se fornito, usato direttamente. Altrimenti serve ctx+filename."
+    ),
+    ctx: Optional[str] = Query(None, description="Context completo (es. username-prefissato)"),
+    filename: Optional[str] = Query(None, description="Filename originale così come caricato"),
+    prefix: Optional[str] = Query(None, description="Prefix filter (opzionale)"),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(10, ge=1),
+    token: str = Query(None, description="Access Token"),
+):
+    if REQUIRED_AUTH:
+        verify_access_token(token, cognito_sdk)
+
+    if not collection_name:
+        if not (ctx and filename):
+            raise HTTPException(422, "Fornisci 'collection_name' oppure 'ctx' + 'filename'.")
+        collection_name = make_collection_name(ctx, filename, 15)
+
+    params = {"skip": skip, "limit": limit}
+    if prefix:
+        params["prefix"] = prefix
+
+    print("#"*120)
+    print(ctx, filename)
+    print(params)
+    print(collection_name)
+    print("#" * 120)
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            f"{NLP_CORE_SERVICE}/document_stores/documents/{collection_name}/",
+            params=params,
+        )
+
+    if resp.status_code != 200:
+        raise HTTPException(status_code=resp.status_code, detail=resp.json())
+
+    return resp.json()
 
 async def _fetch_single_status(client: httpx.AsyncClient,
                                task_id: str,

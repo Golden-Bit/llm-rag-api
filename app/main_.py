@@ -71,25 +71,37 @@ NLP_CORE_SERVICE = config["nlp_core_service"]
 openai_api_keys = config["openai_api_keys"]
 
 
-# --- NEW: helper per ID deterministici di Loader/Collection -----------------
+# --- HELPER: filename -> versioni normalizzate -------------------------------
 def _safe_filename(name: str) -> str:
+    # per mappe loader_*: gli spazi diventano underscore (come già facevi)
     return name.replace(" ", "_")
 
-def make_loader_ids_from_kwargs(ctx: str, filename: str, effective_kwargs: Mapping) -> tuple[str, str, str]:
+def _nospace_filename(name: str) -> str:
+    # per la collection legacy: gli spazi vengono rimossi
+    return name.replace(" ", "_")
+
+# --- HELPER: loader_id deterministico (15 char) ------------------------------
+def make_loader_id_from_kwargs(ctx: str, filename: str, effective_kwargs: Mapping) -> tuple[str, str]:
     """
-    Calcola un ID deterministico (15 char) dal triple {ctx, filename, loader_kwargs}.
-    Include TUTTI i campi dei kwargs (incluso openai_api_key).
-    Ritorna: (id_core, loader_id, collection_name)
+    Ritorna (id_core, loader_id) dove:
+      id_core = short_hash({ctx, filename_safe, loader_kwargs}, length=15)
+      loader_id = f"{id_core}_loader"
+    Include *tutti* i campi dei kwargs (openai_api_key compresa).
     """
     payload = {
         "ctx": ctx,
         "filename": _safe_filename(filename),
-        "loader_kwargs": effective_kwargs,  # già post-merge e specifici per il file-type
+        "loader_kwargs": effective_kwargs,  # post-merge; contiene tutti i campi
     }
-    id_core = short_hash(payload, length=15)     # <-- 15 char
+    id_core = short_hash(payload, length=15)
     loader_id = f"{id_core}_loader"
-    coll_name = f"{id_core}_collection"
-    return id_core, loader_id, coll_name
+    return id_core, loader_id
+
+# --- HELPER: collection name legacy -----------------------------------------
+def make_legacy_collection_name(ctx: str, filename: str) -> str:
+    # esattamente come prima: ctx + filename con spazi rimossi + "_collection"
+    return f"{ctx}{_nospace_filename(filename)}_collection"
+
 
 # ------------------------------------------------------------------
 # Vector‑store IDs  ← hash(JSON(cfg))
@@ -121,6 +133,29 @@ def deep_merge(base: Mapping, override: Mapping) -> dict:
             result[key] = copy.deepcopy(val)
     return dict(result)
 
+# --- GENERATORI ID BASATI SU HASH -------------------------------------------
+def make_name_hash(*parts: str, suffix: str, length: int = 15) -> str:
+    """
+    Crea un identificatore sicuro:
+      id = short_hash("|".join(parts), length) + suffix
+    - Non trasforma i 'parts' (niente replace/strip)
+    - Usare per collection, loader, ecc.
+    """
+    key = "|".join(str(p) for p in parts)
+    return f"{short_hash(key, length=length)}{suffix}"
+
+def make_collection_name(ctx: str, filename: str, length: int = 15) -> str:
+    """Esempio specifico per Document Store collection."""
+    return make_name_hash(ctx, filename, suffix="_collection", length=length)
+
+def make_loader_id(ctx: str, filename: str, chosen_kwargs: Mapping, length: int = 15) -> str:
+    """
+    Loader ID deterministico che include anche i kwargs effettivi (openai_api_key compresa).
+    NB: lascia invariati ctx/filename (niente normalizzazioni).
+    """
+    payload = {"ctx": ctx, "filename": filename, "loader_kwargs": chosen_kwargs}
+    return f"{short_hash(payload, length=length)}_loader"
+
 
 def short_hash(obj: dict | str, length: int = 9) -> str:
     """
@@ -130,6 +165,13 @@ def short_hash(obj: dict | str, length: int = 9) -> str:
     if not isinstance(obj, str):
         obj = json.dumps(obj, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(obj.encode("utf-8")).hexdigest()[:length]
+
+# --- NEW: hash-based collection name (15) ------------------------------------
+import unicodedata
+
+def _nfc(s: str) -> str:
+    return unicodedata.normalize("NFC", s)
+
 
 # Models for handling requests and responses
 class ContextMetadata(BaseModel):
@@ -210,6 +252,8 @@ async def _wait_task_done(
     poll_secs: float = 5.0,
     max_wait: float = 1800.0,          # 30 min → scegli tu
 ):
+
+
     start = time.monotonic()
     while True:
         st = (await client.get(status_url)).json()
@@ -231,19 +275,18 @@ async def _wait_task_done(
 def _build_loader_config_payload(
     context: str,
     file: UploadFile,
-    collection_name: str,
-    loader_config_id: str,
+    collection_name: str | None,      # ignorato
+    loader_config_id: str | None,     # ignorato
     custom_loaders: Optional[Dict[str, str]] = None,
     custom_kwargs: Optional[Dict[str, Dict[str, Any]]] = None,
-) -> dict:
-    """
-    Crea il payload JSON per /document_loaders/configure_loader
-    basandosi sull'estensione del file e sulle convenzioni già in uso.
-    """
-    file_type = file.filename.split(".")[-1].lower()
+) -> tuple[str, str, dict]:
 
-    # mappa estensione → loader
-    loaders = {
+    file_type = file.filename.split(".")[-1].lower()
+    # NB: safe_name SOLO per le mappe del payload (chiave "file" lato core).
+    #     NON influenza gli ID (che usano filename "puro" per l'hash).
+    safe_name = file.filename.replace(" ", "_")
+
+    base_loaders = {
         "png": "ImageDescriptionLoader",
         "jpg": "ImageDescriptionLoader",
         "jpeg": "ImageDescriptionLoader",
@@ -253,73 +296,33 @@ def _build_loader_config_payload(
         "mkv": "VideoDescriptionLoader",
         "default": "UnstructuredLoader",
     }
-
-    # kwargs specifici per ciascun loader (resize, API-key, ecc.)
-    kwargs = {
-        # immagini
-        "png": {
-            "openai_api_key": get_random_openai_api_key(),
-            "resize_to": (256, 256),
-        },
-        "jpg": {
-            "openai_api_key": get_random_openai_api_key(),
-            "resize_to": (256, 256),
-        },
-        "jpeg": {
-            "openai_api_key": get_random_openai_api_key(),
-            "resize_to": (256, 256),
-        },
-        # video
-        "avi": {
-            "resize_to": [256, 256],
-            "num_frames": 10,
-            "openai_api_key": get_random_openai_api_key(),
-        },
-        "mp4": {
-            "resize_to": [256, 256],
-            "num_frames": 10,
-            "openai_api_key": get_random_openai_api_key(),
-        },
-        "mov": {
-            "resize_to": [256, 256],
-            "num_frames": 10,
-            "openai_api_key": get_random_openai_api_key(),
-        },
-        "mkv": {
-            "resize_to": [256, 256],
-            "num_frames": 10,
-            "openai_api_key": get_random_openai_api_key(),
-        },
-        # fallback
-        "default": {
-            "strategy": "hi_res",
-            "partition_via_api": False,
-        },
+    base_kwargs = {
+        "png":  {"openai_api_key": get_random_openai_api_key(), "resize_to": (256, 256)},
+        "jpg":  {"openai_api_key": get_random_openai_api_key(), "resize_to": (256, 256)},
+        "jpeg": {"openai_api_key": get_random_openai_api_key(), "resize_to": (256, 256)},
+        "avi":  {"resize_to": [256, 256], "num_frames": 10, "openai_api_key": get_random_openai_api_key()},
+        "mp4":  {"resize_to": [256, 256], "num_frames": 10, "openai_api_key": get_random_openai_api_key()},
+        "mov":  {"resize_to": [256, 256], "num_frames": 10, "openai_api_key": get_random_openai_api_key()},
+        "mkv":  {"resize_to": [256, 256], "num_frames": 10, "openai_api_key": get_random_openai_api_key()},
+        "default": {"strategy": "hi_res", "partition_via_api": False},
     }
 
-    custom_loaders = custom_loaders if custom_loaders else {}
-    custom_kwargs = custom_kwargs if custom_kwargs else {}
+    eff_loaders = deep_merge(base_loaders, custom_loaders or {})
+    eff_kwargs  = deep_merge(base_kwargs,  custom_kwargs  or {})
 
-    #loaders.update(custom_loaders)
-    #kwargs.update(custom_kwargs)
+    chosen_loader  = eff_loaders.get(file_type, eff_loaders["default"])
+    chosen_kwargs  = eff_kwargs.get(file_type,  eff_kwargs["default"])
 
-    # merge profondo con eventuali override
-    loaders      = deep_merge(loaders, custom_loaders or {})
-    kwargs       = deep_merge(kwargs,  custom_kwargs or {})
+    # === ID deterministici ===
+    computed_loader_id = make_loader_id(context, safe_name, chosen_kwargs, length=15)
+    computed_coll_name = make_collection_name(context, safe_name, length=15)
 
-    # loader e kwargs selezionati
-    chosen_loader = loaders.get(file_type, loaders["default"])
-    chosen_kwargs = kwargs.get(file_type, kwargs["default"])
-
-    # payload conforme all’endpoint configure_loader
-    return {
-        "config_id": loader_config_id,
+    payload = {
+        "config_id": computed_loader_id,
         "path": f"data_stores/data/{context}",
-        "loader_map": {file.filename.replace(" ", "_"): chosen_loader},
-        "loader_kwargs_map": {file.filename.replace(" ", "_"): chosen_kwargs},
-        "metadata_map": {
-            file.filename.replace(" ", "_"): {"source_context": context}
-        },
+        "loader_map":        {safe_name: chosen_loader},
+        "loader_kwargs_map": {safe_name: chosen_kwargs},
+        "metadata_map":      {safe_name: {"source_context": context}},
         "default_metadata": {"source_context": context},
         "recursive": True,
         "max_depth": 5,
@@ -332,11 +335,13 @@ def _build_loader_config_payload(
         "sample_size": 10,
         "randomize_sample": True,
         "sample_seed": 42,
-        "output_store_map": {
-            file.filename.replace(" ", "_"): {"collection_name": collection_name}
-        },
-        "default_output_store": {"collection_name": collection_name},
+        "output_store_map":   {safe_name: {"collection_name": computed_coll_name}},
+        "default_output_store": {"collection_name": computed_coll_name},
     }
+
+    return computed_loader_id, computed_coll_name, payload
+
+
 
 
 async def _ensure_vector_store(
@@ -348,19 +353,7 @@ async def _ensure_vector_store(
     - lo carica in memoria (endpoint /load)
     - restituisce (vector_store_config_id, vector_store_id)
     """
-    '''vector_store_config_id = f"{context}_vector_store_config"
-    vector_store_id        = f"{context}_vector_store"
 
-    vector_store_config = {
-        "config_id": vector_store_config_id,
-        "store_id": vector_store_id,
-        "vector_store_class": "Chroma",
-        "params": {"persist_directory": f"vector_stores/{context}"},
-        "embeddings_model_class": "OpenAIEmbeddings",
-        "embeddings_params": {"api_key": get_random_openai_api_key()},
-        "description": f"Vector store for context {context}",
-        "custom_metadata": {"source_context": context},
-    }'''
     base_cfg = {  # ← solo la “sostanza”
                 "vector_store_class": "Chroma",
                 "params": {"persist_directory": f"vector_stores/{context}"},
@@ -421,51 +414,67 @@ async def _process_context_pipeline(
         "extra_metadata": json.dumps({"file_uuid": file_uuid, **file_metadata})
     }
 
-    files = {"file": (file.filename.replace(" ", "_"), file_content, file.content_type)}
+    files = {"file": (_safe_filename(file.filename), file_content, file.content_type)}
     await _post_or_400(client, f"{NLP_CORE_SERVICE}/data_stores/upload", data=data, files=files)
 
     # ---------- 1. prepare loader ----------------------------------------------
-    loader_id       = f"{ctx}{file.filename.replace(' ', '')}_loader"
-    coll_name       = f"{ctx}{file.filename.replace(' ', '')}_collection"
-
-    loader_payload  = _build_loader_config_payload(
+    # Calcolo deterministico del loader_id; collection name LEGACY (come prima)
+    loader_id, coll_name, loader_payload = _build_loader_config_payload(
         ctx,
         file,
-        coll_name,
-        loader_id,
+        collection_name=None,           # ignorato (legacy inside)
+        loader_config_id=None,          # ignorato (hash inside)
         custom_loaders=loaders,
         custom_kwargs=loader_kwargs,
     )
 
     print("#"*120)
+    print(_safe_filename(file.filename), file.filename)
     print(loaders)
     print(loader_kwargs)
     print(json.dumps(loader_payload, indent=4))
-    print("#" * 120)
+    print("#"*120)
 
-    await _post_or_400(client, f"{NLP_CORE_SERVICE}/document_loaders/configure_loader", json=loader_payload)
+    await _post_or_400(
+        client,
+        f"{NLP_CORE_SERVICE}/document_loaders/configure_loader",
+        json=loader_payload
+    )
 
     # lancia il loader in async e aspetta che finisca
-    await _post_or_400(
+    STEP_1 = await _post_or_400(
         client,
         f"{NLP_CORE_SERVICE}/document_loaders/load_documents_async/{loader_id}",
         data={"task_id": loader_task_id},
     )
-    await _wait_task_done(client, f"{NLP_CORE_SERVICE}/document_loaders/task_status/{loader_task_id}")
+    print("#"*120)
+    print(STEP_1)
+    print("#" * 120)
+
+    WAIT_1 = await _wait_task_done(client, f"{NLP_CORE_SERVICE}/document_loaders/task_status/{loader_task_id}")
+
+    print("#"*120)
+    print(WAIT_1)
+    print("#" * 120)
 
     # ---------- 2. config / load vector store ----------------------------------
     _, vect_id = await _ensure_vector_store(ctx, client)  # idempotente
 
-    await _post_or_400(
+    STEP_2 = await _post_or_400(
         client,
         f"{NLP_CORE_SERVICE}/vector_stores/vector_store/add_documents_from_store_async/{vect_id}",
         params={"document_collection": coll_name, "task_id": vector_task_id},
     )
-
-    await _wait_task_done(
+    print("#"*120)
+    print(STEP_2)
+    print("#" * 120)
+    WAIT_2 = await _wait_task_done(
         client,
         f"{NLP_CORE_SERVICE}/vector_stores/vector_store/task_status/{vector_task_id}"
     )
+    print("#"*120)
+    print(WAIT_2)
+    print("#" * 120)
 
 
 # --------------------------- REWRITE *ENTIRE* helper ---------------------------
@@ -1915,6 +1924,7 @@ async def list_documents_proxy(
     limit: int = Query(10, ge=1, description="Maximum number of documents to return."),
     token: str = Query(None, description="Access Token")
 ):
+
     """
     Re-instrada la richiesta verso l’endpoint originale
     `GET /document_stores/documents/{collection_name}/
@@ -1940,6 +1950,46 @@ async def list_documents_proxy(
     # la risposta dell’API originale è già nel formato atteso da DocumentModel
     return resp.json()
 
+@app.get("/documents", response_model=List[Dict[str, Any]])
+async def list_documents_proxy_resolved(
+    collection_name: Optional[str] = Query(
+        None, description="Se fornito, usato direttamente. Altrimenti serve ctx+filename."
+    ),
+    ctx: Optional[str] = Query(None, description="Context completo (es. username-prefissato)"),
+    filename: Optional[str] = Query(None, description="Filename originale così come caricato"),
+    prefix: Optional[str] = Query(None, description="Prefix filter (opzionale)"),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(10, ge=1),
+    token: str = Query(None, description="Access Token"),
+):
+    if REQUIRED_AUTH:
+        verify_access_token(token, cognito_sdk)
+
+    if not collection_name:
+        if not (ctx and filename):
+            raise HTTPException(422, "Fornisci 'collection_name' oppure 'ctx' + 'filename'.")
+        collection_name = make_collection_name(ctx, filename, 15)
+
+    params = {"skip": skip, "limit": limit}
+    if prefix:
+        params["prefix"] = prefix
+
+    print("#"*120)
+    print(ctx, filename)
+    print(params)
+    print(collection_name)
+    print("#" * 120)
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            f"{NLP_CORE_SERVICE}/document_stores/documents/{collection_name}/",
+            params=params,
+        )
+
+    if resp.status_code != 200:
+        raise HTTPException(status_code=resp.status_code, detail=resp.json())
+
+    return resp.json()
 
 async def _fetch_single_status(client: httpx.AsyncClient,
                                task_id: str,
@@ -2346,7 +2396,7 @@ async def loader_kwargs_schema():
             "mode": {
                 "name": "mode",
                 "type": "string",
-                "default": "elements",
+                "default": "paged",
                 "items": ["single", "elements", "paged"],
                 "example": "elements"
             },
@@ -2355,8 +2405,8 @@ async def loader_kwargs_schema():
             "strategy": {
                 "name": "strategy",
                 "type": "string",
-                "default": "auto",
-                "items": ["auto", "fast", "hi_res", "ocr_only"],
+                "default": "hi_res",
+                "items": ["fast", "hi_res", "ocr_only"], #"auto"
                 "example": "hi_res"
             },
             "hi_res_model_name": {
@@ -2470,7 +2520,7 @@ async def loader_kwargs_schema():
             "chunking_strategy": {
                 "name": "chunking_strategy",
                 "type": "string",
-                "default": "basic",
+                "default": "by_title",
                 "items": ["basic", "by_title"],
                 "example": "by_title"
             },
