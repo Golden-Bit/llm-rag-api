@@ -161,7 +161,7 @@ def make_vector_store_ids(cfg: Mapping) -> tuple[str, str]:
     """
     cfg_json = json.dumps(cfg, sort_keys=True, ensure_ascii=False)
     h = short_hash(cfg_json)                   # 9 caratteri
-    return (f"{h}_vector_store_config", h)
+    return (f"{h}_config", h)
 
 def deep_merge(base: Mapping, override: Mapping) -> dict:
     """
