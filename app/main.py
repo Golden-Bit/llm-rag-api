@@ -1307,7 +1307,13 @@ async def list_files_in_context(contexts: Optional[List[str]] = None):
 
 # Helper function to delete files by UUID
 async def delete_file_by_id(file_id: str):
-    async with httpx.AsyncClient() as client:
+    timeout = httpx.Timeout(
+        connect=60.0,  # handshake lenti
+        read=60.0,    # risposta lenta su liste grandi
+        write=60.0,
+        pool=60.0
+    )
+    async with httpx.AsyncClient(timeout=timeout) as client:
         # List all contexts to find where the file exists
         response = await client.get(f"{NLP_CORE_SERVICE}/data_stores/files")
         if response.status_code != 200:
@@ -1787,12 +1793,12 @@ async def configure_and_load_chain(
 
     default_tools = [{"name": "VectorStoreTools", "kwargs": {"store_id": vectorstore_id}} for vectorstore_id in vectorstore_ids]
 
-    default_tools.append({"name": "MongoDBTools",
-                  "kwargs": {
-                      "connection_string": "mongodb://localhost:27017",
-                      "default_database": f"default_db",
-                      "default_collection": "default_collection"
-                  }})
+    #default_tools.append({"name": "MongoDBTools",
+    #              "kwargs": {
+    #                  "connection_string": "mongodb://localhost:27017",
+    #                  "default_database": f"default_db",
+    #                  "default_collection": "default_collection"
+    #              }})
 
     # ── Applico le custom_tools: sovrascrivo o aggiungo ────────────────────
     tools_by_name = {t["name"]: t for t in default_tools}
@@ -1800,6 +1806,12 @@ async def configure_and_load_chain(
     for ct in input_data.custom_server_tools:
         tools_by_name[ct["name"]] = ct
     tools = list(tools_by_name.values())
+
+
+    _NOOP_TOOL = {"name": "NoopTool", "kwargs": {}}
+
+    if not tools:
+        tools = [_NOOP_TOOL]
 
 
     # Configurazione della chain
