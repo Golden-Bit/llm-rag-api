@@ -1,3 +1,5 @@
+
+from __future__ import annotations
 import asyncio
 import base64
 import copy
@@ -1634,6 +1636,7 @@ async def configure_and_load_chain(
     if llm_cfg.api_key is None:  # riempi API-key on-the-fly
         llm_cfg.api_key = get_random_openai_api_key()
 
+    print(llm_cfg)
     llm_config_id, llm_id = make_llm_ids(llm_cfg)  # ID deterministici
 
     # ------------------------------------------------------------------
@@ -3014,12 +3017,56 @@ from typing import List, Dict, Any
 from fastapi import HTTPException, Body
 from pydantic import BaseModel, Field
 
-# ╭──── prezzi (override via env) ───────────────────────────────────────────╮
-GPT4O_IN_PRICE        = float(os.getenv("GPT4O_IN_PRICE",        "0.01")) * 1000  # USD / 1k tok
-GPT4O_OUT_PRICE       = float(os.getenv("GPT4O_OUT_PRICE",       "0.03")) * 1000
-GPT4O_MINI_IN_PRICE   = float(os.getenv("GPT4O_MINI_IN_PRICE",   "0.002")) * 1000
-GPT4O_MINI_OUT_PRICE  = float(os.getenv("GPT4O_MINI_OUT_PRICE",  "0.006")) * 1000
-# ╰──────────────────────────────────────────────────────────────────────────╯
+
+# ───────────────────────────────── gpt-5 family ─────────────────────────────────
+GPT5_IN_PRICE              = float(os.getenv("GPT5_IN_PRICE",              "0.00125")) * 1000
+GPT5_CACHED_IN_PRICE       = float(os.getenv("GPT5_CACHED_IN_PRICE",       "0.000125")) * 1000
+GPT5_OUT_PRICE             = float(os.getenv("GPT5_OUT_PRICE",             "0.010")) * 1000
+
+GPT5_MINI_IN_PRICE         = float(os.getenv("GPT5_MINI_IN_PRICE",         "0.00025")) * 1000
+GPT5_MINI_CACHED_IN_PRICE  = float(os.getenv("GPT5_MINI_CACHED_IN_PRICE",  "0.000025")) * 1000
+GPT5_MINI_OUT_PRICE        = float(os.getenv("GPT5_MINI_OUT_PRICE",        "0.002")) * 1000
+
+GPT5_NANO_IN_PRICE         = float(os.getenv("GPT5_NANO_IN_PRICE",         "0.00005")) * 1000
+GPT5_NANO_CACHED_IN_PRICE  = float(os.getenv("GPT5_NANO_CACHED_IN_PRICE",  "0.000005")) * 1000
+GPT5_NANO_OUT_PRICE        = float(os.getenv("GPT5_NANO_OUT_PRICE",        "0.0004")) * 1000
+
+GPT5_CHAT_LATEST_IN_PRICE         = float(os.getenv("GPT5_CHAT_LATEST_IN_PRICE",         "0.00125")) * 1000
+GPT5_CHAT_LATEST_CACHED_IN_PRICE  = float(os.getenv("GPT5_CHAT_LATEST_CACHED_IN_PRICE",  "0.000125")) * 1000
+GPT5_CHAT_LATEST_OUT_PRICE        = float(os.getenv("GPT5_CHAT_LATEST_OUT_PRICE",        "0.010")) * 1000
+
+GPT5_CODEX_IN_PRICE         = float(os.getenv("GPT5_CODEX_IN_PRICE",         "0.00125")) * 1000
+GPT5_CODEX_CACHED_IN_PRICE  = float(os.getenv("GPT5_CODEX_CACHED_IN_PRICE",  "0.000125")) * 1000
+GPT5_CODEX_OUT_PRICE        = float(os.getenv("GPT5_CODEX_OUT_PRICE",        "0.010")) * 1000
+
+# ───────────────────────────────── gpt-4.1 family ───────────────────────────────
+GPT41_IN_PRICE             = float(os.getenv("GPT41_IN_PRICE",             "0.002")) * 1000
+GPT41_CACHED_IN_PRICE      = float(os.getenv("GPT41_CACHED_IN_PRICE",      "0.0005")) * 1000
+GPT41_OUT_PRICE            = float(os.getenv("GPT41_OUT_PRICE",            "0.008")) * 1000
+
+GPT41_MINI_IN_PRICE        = float(os.getenv("GPT41_MINI_IN_PRICE",        "0.0004")) * 1000
+GPT41_MINI_CACHED_IN_PRICE = float(os.getenv("GPT41_MINI_CACHED_IN_PRICE", "0.0001")) * 1000
+GPT41_MINI_OUT_PRICE       = float(os.getenv("GPT41_MINI_OUT_PRICE",       "0.0016")) * 1000
+
+GPT41_NANO_IN_PRICE        = float(os.getenv("GPT41_NANO_IN_PRICE",        "0.0001")) * 1000
+GPT41_NANO_CACHED_IN_PRICE = float(os.getenv("GPT41_NANO_CACHED_IN_PRICE", "0.000025")) * 1000
+GPT41_NANO_OUT_PRICE       = float(os.getenv("GPT41_NANO_OUT_PRICE",       "0.0004")) * 1000
+
+# ───────────────────────────────── gpt-4o family ────────────────────────────────
+GPT4O_IN_PRICE             = float(os.getenv("GPT4O_IN_PRICE",             "0.0025")) * 1000
+GPT4O_CACHED_IN_PRICE      = float(os.getenv("GPT4O_CACHED_IN_PRICE",      "0.00125")) * 1000
+GPT4O_OUT_PRICE            = float(os.getenv("GPT4O_OUT_PRICE",            "0.010")) * 1000
+
+# variante datata (cached input non specificato: fallback = input)
+GPT4O_20240513_IN_PRICE        = float(os.getenv("GPT4O_20240513_IN_PRICE",        "0.005")) * 1000
+GPT4O_20240513_CACHED_IN_PRICE = float(os.getenv("GPT4O_20240513_CACHED_IN_PRICE", "0.005")) * 1000
+GPT4O_20240513_OUT_PRICE       = float(os.getenv("GPT4O_20240513_OUT_PRICE",       "0.015")) * 1000
+
+# 4o-mini (aggiornato ai nuovi valori)
+GPT4O_MINI_IN_PRICE         = float(os.getenv("GPT4O_MINI_IN_PRICE",         "0.00015")) * 1000
+GPT4O_MINI_CACHED_IN_PRICE  = float(os.getenv("GPT4O_MINI_CACHED_IN_PRICE",  "0.000075")) * 1000
+GPT4O_MINI_OUT_PRICE        = float(os.getenv("GPT4O_MINI_OUT_PRICE",        "0.0006"))  * 1000
+
 PER_TOOL_TOKEN_EST    = int(os.getenv("PER_TOOL_TOKEN_EST",      "300"))
 DEFAULT_TOOLS_COUNT   = int(os.getenv("DEFAULT_TOOLS_COUNT",     "3"))
 MAX_OUTPUT_TOKENS_DEF = int(os.getenv("MAX_OUTPUT_TOKENS",       "500"))
@@ -3047,18 +3094,73 @@ class InteractionCost(BaseModel):
 def _tok_est(text: str) -> int:          # 1 token ≈ 4 caratteri
     return math.ceil(len(text) / 4)
 
+# ▼ tabella modelli → prezzi (tutti già in “/1000”)
+_MODEL_PRICE_TABLE = [
+    ("gpt-5",              GPT5_IN_PRICE,              GPT5_OUT_PRICE),
+    ("gpt-5-mini",         GPT5_MINI_IN_PRICE,         GPT5_MINI_OUT_PRICE),
+    ("gpt-5-nano",         GPT5_NANO_IN_PRICE,         GPT5_NANO_OUT_PRICE),
+    ("gpt-5-chat-latest",  GPT5_CHAT_LATEST_IN_PRICE,  GPT5_CHAT_LATEST_OUT_PRICE),
+    ("gpt-5-codex",        GPT5_CODEX_IN_PRICE,        GPT5_CODEX_OUT_PRICE),
+
+    ("gpt-4.1",            GPT41_IN_PRICE,             GPT41_OUT_PRICE),
+    ("gpt-4.1-mini",       GPT41_MINI_IN_PRICE,        GPT41_MINI_OUT_PRICE),
+    ("gpt-4.1-nano",       GPT41_NANO_IN_PRICE,        GPT41_NANO_OUT_PRICE),
+
+    ("gpt-4o",             GPT4O_IN_PRICE,             GPT4O_OUT_PRICE),
+    ("gpt-4o-2024-05-13",  GPT4O_20240513_IN_PRICE,    GPT4O_20240513_OUT_PRICE),
+    ("gpt-4o-mini",        GPT4O_MINI_IN_PRICE,        GPT4O_MINI_OUT_PRICE),
+]
+
+# fallback se model non mappa (qui uso 4o come default)
+_FALLBACK_IN_PRICE  = GPT4O_IN_PRICE
+_FALLBACK_OUT_PRICE = GPT4O_OUT_PRICE
+
+def _build_cond_expr(value_pairs: list[tuple[str, float]]) -> str:
+    """
+    Costruisce un'unica espressione tipo:
+      v1 if {model_name}=='m1' else (v2 if {model_name}=='m2' else (... default ...))
+    NB: i valori sono numeri letterali (già /1000), nessun simbolo extra richiesto al client.
+    """
+    expr = f"{_FALLBACK_IN_PRICE}"  # placeholder, sovrascritto subito sotto per IN/OUT
+    # la funzione è agnostica; settiamo expr fuori prima di usarla per OUT
+    for name, val in reversed(value_pairs):
+        expr = f"{val} if {{model_name}}=='{name}' else ({expr})"
+    return expr
+
 def _price_for(model_name: str) -> tuple[float, float, str, str]:
     """
     → (price_in, price_out, cond_in_str, cond_out_str)
+    - price_in/out: numeri già pronti per il modello richiesto (se noto, altrimenti fallback)
+    - cond_in/out : stringhe-condizione Python-style su *tutti* i modelli,
+                    con numeri letterali (nessuna costante richiesta al client).
     """
-    cond_in  = ("{GPT4O_MINI_IN_PRICE}  if {model_name} = 'gpt-4o-mini' "
-                "else {GPT4O_IN_PRICE}")
-    cond_out = ("{GPT4O_MINI_OUT_PRICE} if {model_name} = 'gpt-4o' "
-                "else {GPT4O_OUT_PRICE}")
+    m = (model_name or "").strip().lower()
 
-    if "mini" in model_name.lower():
-        return GPT4O_MINI_IN_PRICE, GPT4O_MINI_OUT_PRICE, cond_in, cond_out
-    return GPT4O_IN_PRICE, GPT4O_OUT_PRICE, cond_in, cond_out
+    # lookup puntuale
+    pin = _FALLBACK_IN_PRICE
+    pout = _FALLBACK_OUT_PRICE
+    for name, _pin, _pout in _MODEL_PRICE_TABLE:
+        if m == name:
+            pin, pout = _pin, _pout
+            break
+
+    # condizioni per IN
+    in_pairs  = [(name, _pin)  for (name, _pin, _pout) in _MODEL_PRICE_TABLE]
+    # condizioni per OUT
+    out_pairs = [(name, _pout) for (name, _pin, _pout) in _MODEL_PRICE_TABLE]
+
+    # costruisci cond IN
+    cond_in = f"{_FALLBACK_IN_PRICE}"
+    for name, val in reversed(in_pairs):
+        cond_in = f"{val} if {{model_name}}=='{name}' else ({cond_in})"
+
+    # costruisci cond OUT
+    cond_out = f"{_FALLBACK_OUT_PRICE}"
+    for name, val in reversed(out_pairs):
+        cond_out = f"{val} if {{model_name}}=='{name}' else ({cond_out})"
+
+    return pin, pout, cond_in, cond_out
+
 
 async def _get_chain_config(cfg_id: str) -> Dict[str, Any]:
     async with httpx.AsyncClient() as c:
@@ -4073,3 +4175,177 @@ async def create_cancel_deeplink(body: DeeplinkCancelIn):
         raise HTTPException(status_code=getattr(e, "status_code", 500), detail=getattr(e, "payload", str(e)))
 
 
+
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helper di classificazione & costruzione schede
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _family_of(model: str) -> str:
+    m = (model or "").lower()
+    if m.startswith("gpt-5"):  return "gpt-5"
+    if m.startswith("gpt-4.1"): return "gpt-4.1"
+    if m.startswith("gpt-4o"):  return "gpt-4o"
+    return "other"
+
+_MODEL_PRICES: dict[str, dict[str, float | None]] = {
+    "gpt-5": {"input_per_1k": GPT5_IN_PRICE, "cached_input_per_1k": GPT5_CACHED_IN_PRICE, "output_per_1k": GPT5_OUT_PRICE},
+    "gpt-5-mini": {"input_per_1k": GPT5_MINI_IN_PRICE, "cached_input_per_1k": GPT5_MINI_CACHED_IN_PRICE, "output_per_1k": GPT5_MINI_OUT_PRICE},
+    "gpt-5-nano": {"input_per_1k": GPT5_NANO_IN_PRICE, "cached_input_per_1k": GPT5_NANO_CACHED_IN_PRICE, "output_per_1k": GPT5_NANO_OUT_PRICE},
+    "gpt-5-chat-latest": {"input_per_1k": GPT5_CHAT_LATEST_IN_PRICE, "cached_input_per_1k": GPT5_CHAT_LATEST_CACHED_IN_PRICE, "output_per_1k": GPT5_CHAT_LATEST_OUT_PRICE},
+    "gpt-5-codex": {"input_per_1k": GPT5_CODEX_IN_PRICE, "cached_input_per_1k": GPT5_CODEX_CACHED_IN_PRICE, "output_per_1k": GPT5_CODEX_OUT_PRICE},
+    "gpt-4.1": {"input_per_1k": GPT41_IN_PRICE, "cached_input_per_1k": GPT41_CACHED_IN_PRICE, "output_per_1k": GPT41_OUT_PRICE},
+    "gpt-4.1-mini": {"input_per_1k": GPT41_MINI_IN_PRICE, "cached_input_per_1k": GPT41_MINI_CACHED_IN_PRICE, "output_per_1k": GPT41_MINI_OUT_PRICE},
+    "gpt-4.1-nano": {"input_per_1k": GPT41_NANO_IN_PRICE, "cached_input_per_1k": GPT41_NANO_CACHED_IN_PRICE, "output_per_1k": GPT41_NANO_OUT_PRICE},
+    "gpt-4o": {"input_per_1k": GPT4O_IN_PRICE, "cached_input_per_1k": GPT4O_CACHED_IN_PRICE, "output_per_1k": GPT4O_OUT_PRICE},
+    "gpt-4o-2024-05-13": {"input_per_1k": GPT4O_20240513_IN_PRICE, "cached_input_per_1k": GPT4O_20240513_CACHED_IN_PRICE, "output_per_1k": GPT4O_20240513_OUT_PRICE},
+    "gpt-4o-mini": {"input_per_1k": GPT4O_MINI_IN_PRICE, "cached_input_per_1k": GPT4O_MINI_CACHED_IN_PRICE, "output_per_1k": GPT4O_MINI_OUT_PRICE},
+}
+
+
+def _capabilities_for(model: str) -> dict:
+    fam = _family_of(model)
+    base = {"text": True, "tools": True, "streaming": True}
+    if fam in ("gpt-5", "gpt-4o"):
+        return {**base, "vision": True}
+    if fam == "gpt-4.1":
+        return {**base, "vision": False}
+    return {**base, "vision": False}
+
+
+def _kwargs_schema_for(model: str) -> dict:
+    fam = _family_of(model)
+    common = {
+        "max_tokens": {"type": "integer", "min": 1, "max": 128_000, "default": 16_000, "description": "Limite massimo di token di output."},
+        "temperature": {"type": "number", "min": 0.0, "max": 2.0, "step": 0.01, "default": 1.0, "description": "Creatività del modello."},
+        "top_p": {"type": "number", "min": 0.0, "max": 1.0, "step": 0.01, "default": 1.0, "description": "Nucleus sampling."},
+        "presence_penalty": {"type": "number", "min": -2.0, "max": 2.0, "step": 0.01, "default": 0.0, "description": "Penalizza termini presenti."},
+        "frequency_penalty": {"type": "number", "min": -2.0, "max": 2.0, "step": 0.01, "default": 0.0, "description": "Penalizza ripetizioni."},
+        "seed": {"type": "integer", "min": 0, "max": 2**31-1, "default": None, "description": "Seed opzionale."},
+    }
+    if fam == "gpt-5":
+        common["temperature"] = {"type": "number", "fixed": 1.0, "default": 1.0, "description": "FISSA a 1.0 per gpt-5*."}
+    if model == "gpt-4o-2024-05-13":
+        common["max_tokens"]["description"] += " (modello legacy)."
+    return common
+
+
+def _notes_for(model: str) -> list[str]:
+    fam = _family_of(model)
+    notes: list[str] = []
+    if fam == "gpt-5":
+        notes.append("La temperatura è fissa a 1.0; altri valori generano 400.")
+    if model == "gpt-4o-2024-05-13":
+        notes.append("Variante legacy di gpt-4o.")
+    return notes
+
+
+def _description_for(model: str) -> str:
+    fam = _family_of(model)
+    if model == "gpt-5-codex":
+        return "Specializzazione codice della famiglia gpt-5."
+    if fam == "gpt-5":
+        return "Modelli di ultima generazione, multimodali."
+    if fam == "gpt-4o":
+        return "Modelli ottimizzati per input multimodali e latenza ridotta."
+    if fam == "gpt-4.1":
+        return "Modelli general-purpose stabili."
+    return "Modello generico."
+
+
+def _build_model_entry(name: str) -> dict:
+    prices = _MODEL_PRICES.get(
+        name,
+        {"input_per_1k": _FALLBACK_IN_PRICE, "cached_input_per_1k": _FALLBACK_IN_PRICE, "output_per_1k": _FALLBACK_OUT_PRICE},
+    )
+    return {
+        "name": name,
+        "family": _family_of(name),
+        "provider": "openai",
+        "currency": "Credits",
+        "unit": "per 1K tokens",
+        "prices": prices,
+        "capabilities": _capabilities_for(name),
+        "defaults": {"model_name": name, "max_tokens": 16_000, "temperature": 1.0},
+        "kwargs_schema": _kwargs_schema_for(name),
+        "supports_cached_input": prices.get("cached_input_per_1k") is not None,
+        "deprecated": (name == "gpt-4o-2024-05-13"),
+        "description": _description_for(name),
+        "notes": _notes_for(name),
+    }
+
+_SUPPORTED_MODELS = [
+    "gpt-5",
+    "gpt-5-mini",
+    "gpt-5-nano",
+    "gpt-5-chat-latest",
+    "gpt-5-codex",
+    "gpt-4.1",
+    "gpt-4.1-mini",
+    "gpt-4.1-nano",
+    "gpt-4o",
+    "gpt-4o-2024-05-13",
+    "gpt-4o-mini",
+]
+
+class ModelsCatalogResponse(BaseModel):
+    currency: str = "Credits"
+    unit: str = "per 1K tokens"
+    models: List[Dict[str, Any]]
+    last_updated: str
+
+
+@app.get("/models/catalog", response_model=ModelsCatalogResponse)
+def get_models_catalog():
+    models = [_build_model_entry(m) for m in _SUPPORTED_MODELS]
+    return ModelsCatalogResponse(models=models, last_updated=datetime.utcnow().isoformat())
+
+
+@app.get("/models/{model_name}", response_model=Dict[str, Any])
+def get_model(model_name: str):
+    name = model_name.strip()
+    if name not in _SUPPORTED_MODELS:
+        raise HTTPException(404, f"Modello non supportato: {name}")
+    return _build_model_entry(name)
+
+
+# Validazione kwargs (opzionale ma utile per la UI)
+class ValidateKwargsIn(BaseModel):
+    model_name: str
+    kwargs: Dict[str, Any]
+
+
+class ValidateKwargsOut(BaseModel):
+    ok: bool
+    errors: List[str] = []
+    normalized: Dict[str, Any] = {}
+    schema: Dict[str, Any] = {}
+
+
+@app.post("/models/validate_kwargs", response_model=ValidateKwargsOut)
+def validate_model_kwargs(body: ValidateKwargsIn):
+    schema = _kwargs_schema_for(body.model_name)
+    errors: List[str] = []
+    normalized: Dict[str, Any] = {}
+
+    for k, v in body.kwargs.items():
+        if k not in schema:
+            errors.append(f"Parametro non supportato: {k}")
+            continue
+        spec = schema[k]
+        if "fixed" in spec and v != spec["fixed"]:
+            errors.append(f"{k} deve essere fisso a {spec['fixed']}")
+        if spec.get("type") in ("integer", "number"):
+            try:
+                fv = float(v)
+                if "min" in spec and fv < spec["min"]:
+                    errors.append(f"{k} < min ({spec['min']})")
+                if "max" in spec and fv > spec["max"]:
+                    errors.append(f"{k} > max ({spec['max']})")
+            except Exception:
+                errors.append(f"{k} deve essere numerico")
+        normalized[k] = v
+
+    return ValidateKwargsOut(ok=(len(errors) == 0), errors=errors, normalized=normalized, schema=schema)
