@@ -28,6 +28,9 @@ import unicodedata
 from pathlib import Path
 from typing import Literal, Optional, Dict, Any, Union, Annotated
 from pydantic import BaseModel, Field
+
+from app.activity_tracker.tracker import create_activity, update_activity_status, \
+    update_upload_activity_from_task_status, finalize_activity, append_response_chunk, list_activities
 from app.auth_sdk.sdk import CognitoSDK, AccessTokenRequest
 from app.payments_sdk.sdk import (
     ApiError,
@@ -45,6 +48,7 @@ from app.payments_sdk.sdk import (
 from pydantic import BaseModel, Field, model_validator
 from app.system_messages.client_tools_utilities import ToolSpec
 from app.system_messages.system_message_1 import get_system_message
+from app.utils.auth_utils import get_username_from_access_token
 from app.utils.payments_utils import (_mk_plans_client, _find_current_subscription_id, _sdk, PLANS_SUCCESS_URL_DEF, \
                                       PLANS_CANCEL_URL_DEF, _variant_to_portal_preset, VARIANTS_BUCKET, RETURN_URL,
                                       _dataclass_to_dict,
@@ -681,6 +685,7 @@ async def _process_context_pipeline(
     *,                          # NEW
     user_id: str,               # NEW
     upload_task_id: str,        # NEW
+    activity_id: str
 ):
     """
     Esegue TUTTE le operazioni “pesanti” per un singolo context:
@@ -690,6 +695,11 @@ async def _process_context_pipeline(
     Tutte le chiamate sono già non-bloccanti vs l'utente; qui le orchestriamo.
     """
     try:
+        # ⬇️ NUOVO: entra in RUNNING a inizio lavorazione del primo contesto
+        if activity_id:
+            update_activity_status(user_id=user_id, activity_id=activity_id, status="RUNNING",
+                                   extra={"upload_task_id": upload_task_id})
+
         # ---------- 0. upload file --------------------------------------------------
         data  = {
             "subdir": ctx,
@@ -728,6 +738,15 @@ async def _process_context_pipeline(
         # NEW: segna LOADER come RUNNING
         await _set_ctx_status(user_id, upload_task_id, ctx, loader_status="RUNNING")
 
+        if activity_id:
+            agg = _read_task(user_id, upload_task_id)
+            if agg:
+                update_upload_activity_from_task_status(
+                    user_id=user_id,
+                    activity_id=activity_id,
+                    task_status=agg.get("status", "RUNNING")
+                )
+
         # lancia il loader in async e aspetta che finisca
         STEP_1 = await _post_or_400(
             client,
@@ -746,8 +765,22 @@ async def _process_context_pipeline(
 
         # NEW: aggiorna stato LOADER al termine
         await _set_ctx_status(user_id, upload_task_id, ctx, loader_status=WAIT_1.get("status", "DONE"))
+
+        # ⬇️ allineo attività a stato AGGREGATO dopo loader
+        if activity_id:
+            agg = _read_task(user_id, upload_task_id)
+            if agg:
+                update_upload_activity_from_task_status(
+                    user_id=user_id,
+                    activity_id=activity_id,
+                    task_status=agg.get("status", "RUNNING")
+                )
+
         if WAIT_1.get("status") == "ERROR":
             await _set_ctx_status(user_id, upload_task_id, ctx, error=str(WAIT_1.get("error") or "Loader failed"))
+            if activity_id:
+                finalize_activity(user_id=user_id, activity_id=activity_id, status="ERROR",
+                                  extra={"error": str(WAIT_1.get("error") or "Loader failed")})
             return  # stop su errore
 
         # ---------- 2. config / load vector store ----------------------------------
@@ -755,6 +788,17 @@ async def _process_context_pipeline(
 
         # NEW: segna VECTOR come RUNNING
         await _set_ctx_status(user_id, upload_task_id, ctx, vector_status="RUNNING")
+
+
+        # ⬇️ allineo attività (aggiornamento intermedio)
+        if activity_id:
+            agg = _read_task(user_id, upload_task_id)
+            if agg:
+                update_upload_activity_from_task_status(
+                    user_id=user_id,
+                    activity_id=activity_id,
+                    task_status=agg.get("status", "RUNNING")
+                )
 
         STEP_2 = await _post_or_400(
             client,
@@ -775,8 +819,22 @@ async def _process_context_pipeline(
 
         # NEW: aggiorna stato VECTOR al termine
         await _set_ctx_status(user_id, upload_task_id, ctx, vector_status=WAIT_2.get("status", "DONE"))
+
+        # ⬇️ allineo attività allo stato FINALE aggregato (se tutti contesti finiti → COMPLETED)
+        if activity_id:
+            agg = _read_task(user_id, upload_task_id)
+            if agg:
+                update_upload_activity_from_task_status(
+                    user_id=user_id,
+                    activity_id=activity_id,
+                    task_status=agg.get("status", "RUNNING")
+                )
+
         if WAIT_2.get("status") == "ERROR":
             await _set_ctx_status(user_id, upload_task_id, ctx, error=str(WAIT_2.get("error") or "Vector failed"))
+            if activity_id:
+                finalize_activity(user_id=user_id, activity_id=activity_id, status="ERROR",
+                                  extra={"error": str(WAIT_2.get("error") or "Vector failed")})
             return
 
         # se arrivo qui il contesto è completato; _recompute_overall_status() farà il resto
@@ -786,6 +844,10 @@ async def _process_context_pipeline(
             await _set_ctx_status(user_id, upload_task_id, ctx, error=str(e))
         except Exception:
             pass
+        # ⬇️ marca anche l'attività come errore
+        if activity_id:
+            finalize_activity(user_id=user_id, activity_id=activity_id, status="ERROR",
+                              extra={"error": str(e)})
 
 # CHANGED: aggiunto user_id; crea task aggregato e lo passa ai worker; ritorna upload_task_id
 async def upload_file_to_contexts_async(
@@ -797,6 +859,7 @@ async def upload_file_to_contexts_async(
     loaders: Optional[Dict[str, str]] = None,
     loader_kwargs: Optional[Dict[str, Dict[str, Any]]] = None,
     user_id: Optional[str] = None,              # NEW
+    activity_id: Optional[str] = None,
 ):
     """
     Orchestratore: prepara i task-id, accoda le pipeline in BackgroundTasks
@@ -847,6 +910,7 @@ async def upload_file_to_contexts_async(
             loader_kwargs,                 # passiamo il client già creato
             user_id=(user_id or "unknown"),# NEW
             upload_task_id=upload_task_id, # NEW
+            activity_id=activity_id,
         )
 
     # la response torna SUBITO (retrocompat + nuovo upload_task_id)
@@ -1399,6 +1463,12 @@ async def upload_file_to_multiple_contexts(
     if REQUIRED_AUTH:
         verify_access_token(token, cognito_sdk)
 
+    # ─────────────── NEW: username dal token se non fornito ───────────────
+    if not username and token:
+        # Usa l’helper (chiama SDK.get_user_info e ne estrae lo username)
+        username = get_username_from_access_token(cognito_sdk, token)
+    # ──────────────────────────────────────────────────────────────────────
+
     ####################################################################################################################
     # TODO:
     #  - verifica se in path è presente prefisso, altrimenti aggiungi (dovremo richiedere anche username in input)
@@ -1543,6 +1613,23 @@ async def upload_file_to_multiple_contexts_async(
         subscription_id=subscription_id
     )
 
+    # === ⬇️ NUOVO: CREA RECORD ATTIVITÀ (UPLOAD_ASYNC) ===
+    user_id = username or "unknown"
+    act_payload = {
+        "filename": file.filename,
+        "contexts": contexts,
+        "description": description,
+        "loaders": json.loads(loaders) if loaders else None,
+        "loader_kwargs": json.loads(loader_kwargs) if loader_kwargs else None,
+    }
+    activity_id = create_activity(
+        user_id=user_id,
+        activity_type="UPLOAD_ASYNC",
+        cost_usd=credits_to_consume,
+        payload=act_payload,
+        metadata={"filename": file.filename}
+    )
+
     result = await upload_file_to_contexts_async(
         file,
         contexts,
@@ -1551,6 +1638,7 @@ async def upload_file_to_multiple_contexts_async(
         loaders=loaders_dict,
         loader_kwargs=kwargs_dict,
         user_id=username,  # NEW: associa all’utente
+        activity_id=activity_id
     )
     return result
 
@@ -2492,8 +2580,109 @@ async def stream_events_chain(
     # Il media_type è lo stesso dell’upstream (“application/json”)
     return StreamingResponse(relay(), media_type="application/json")
 
-
 @app.post("/stream_events_chain")
+async def stream_events_chain(
+    body: ExecuteChainRequest,
+):
+    if REQUIRED_AUTH:
+        verify_access_token(body.token, cognito_sdk)
+
+    # username dal token
+    username = get_username_from_access_token(cognito_sdk, body.token)
+
+    # === 1) ESTRAZIONE messaggio + history dal body ===
+    msg = None
+    hist = []
+    if body.query:
+        msg = (body.query or {}).get("input", "")
+        hist = (body.query or {}).get("chat_history", []) or []
+    else:
+        msg = body.input_text or ""
+        try:
+            hist = [[(h.get("role") or "user"), json.dumps(h.get("parts") or [])] for h in (body.chat_history or [])]
+        except Exception:
+            hist = []
+
+    # === 2) STIMA COSTO ===
+    icost = await estimate_chain_interaction_cost(
+        EstimateInteractionRequest(
+            chain_id=body.chain_id,
+            chain_config=None,
+            message=msg or "",
+            chat_history=hist or [],
+        )
+    )
+    credits_to_consume = icost.cost_total_usd
+
+    # === 3) CONSUMO CREDITI ===
+    await _consume_credits_or_402(
+        body.token,
+        credits_to_consume,
+        reason=f"chat.stream_events chain_id={body.chain_id} len(message)={len(msg or '')}",
+        subscription_id=body.subscription_id
+    )
+
+    # === CREA RECORD ATTIVITÀ STREAM ===
+    user_id = username
+    payload = body.get_payload()
+    activity_id = create_activity(
+        user_id=user_id,
+        activity_type="STREAM_EVENTS",
+        cost_usd=credits_to_consume,
+        payload=payload,
+        metadata={"chain_id": body.chain_id}
+    )
+    update_activity_status(user_id=user_id, activity_id=activity_id, status="RUNNING")
+
+    async def relay():
+        timeout = httpx.Timeout(600.0, connect=600.0, read=600.0, write=600.0)
+        errored = False
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                payload = body.get_payload()
+                async with client.stream(
+                    "POST",
+                    f"{NLP_CORE_SERVICE}/chains/stream_events_chain",
+                    json=payload
+                ) as resp:
+                    if resp.status_code != 200:
+                        detail = await resp.aread()
+                        errored = True
+                        finalize_activity(
+                            user_id=user_id,
+                            activity_id=activity_id,
+                            status="ERROR",
+                            extra={"error": detail.decode() if isinstance(detail, (bytes, bytearray)) else str(detail)}
+                        )
+                        raise HTTPException(resp.status_code, detail.decode() if isinstance(detail, (bytes, bytearray)) else str(detail))
+
+                    async for chunk in resp.aiter_bytes():
+                        append_response_chunk(user_id=user_id, activity_id=activity_id, chunk=chunk)
+                        yield chunk
+
+        except Exception as e:
+            if not errored:
+                errored = True
+                finalize_activity(
+                    user_id=user_id,
+                    activity_id=activity_id,
+                    status="ERROR",
+                    extra={"error": str(e)}
+                )
+            raise
+        finally:
+            # Se siamo arrivati qui senza errori, chiudi in COMPLETED e valorizza end_time
+            if not errored:
+                finalize_activity(
+                    user_id=user_id,
+                    activity_id=activity_id,
+                    status="COMPLETED"
+                )
+
+    return StreamingResponse(relay(), media_type="application/json")
+
+
+'''@app.post("/stream_events_chain")
 async def stream_events_chain(
     body: ExecuteChainRequest,                  # lo stesso schema usato altrove
 ):
@@ -2504,6 +2693,14 @@ async def stream_events_chain(
 
     if REQUIRED_AUTH:
         verify_access_token(body.token, cognito_sdk)
+
+    # ─────────────── NEW: username dal token se non fornito ───────────────
+    t_1 = time.time()
+    username = get_username_from_access_token(cognito_sdk, body.token)
+    print("#" * 120)
+    print(time.time() - t_1)
+    print("#" * 120)
+    # ──────────────────────────────────────────────────────────────────────
 
     # === 1) ESTRAZIONE messaggio + history dal body ===
     msg = None
@@ -2543,31 +2740,57 @@ async def stream_events_chain(
         subscription_id=body.subscription_id
     )
 
+
+    # === ⬇️ NUOVO: CREA RECORD ATTIVITÀ STREAM ===
+    user_id = username  # se vuoi, ricava da token via SDK
+    payload = body.get_payload()
+    activity_id = create_activity(
+        user_id=user_id,
+        activity_type="STREAM_EVENTS",
+        cost_usd=credits_to_consume,
+        payload=payload,
+        metadata={"chain_id": body.chain_id}
+    )
+    # mettila subito RUNNING
+    update_activity_status(user_id=user_id, activity_id=activity_id, status="RUNNING")
+
     # ------------------------------------------------------------------ #
     # Wrapper per rilanciare upstream e ributtare giù i chunk “as-is”.   #
     # ------------------------------------------------------------------ #
     async def relay():
         timeout = httpx.Timeout(600.0, connect=600.0, read=600.0, write=600.0)
-        async with httpx.AsyncClient(timeout=timeout) as client:
-           payload = body.get_payload()
-           print("🔔 proxy sending payload:", payload)
-           async with client.stream(
-                   "POST",
-                   f"{NLP_CORE_SERVICE}/chains/stream_events_chain",
-                   json=payload
-           ) as resp:
-                if resp.status_code != 200:
-                    # Propaga l’errore così com’è
-                    detail = await resp.aread()
-                    raise HTTPException(resp.status_code, detail.decode())
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+               payload = body.get_payload()
+               print("🔔 proxy sending payload:", payload)
+               async with client.stream(
+                       "POST",
+                       f"{NLP_CORE_SERVICE}/chains/stream_events_chain",
+                       json=payload
+               ) as resp:
+                    if resp.status_code != 200:
+                        # Propaga l’errore così com’è
+                        detail = await resp.aread()
+                        # ⬇️ registra errore attività e rilancia
+                        finalize_activity(user_id=user_id, activity_id=activity_id, status="ERROR",
+                                          extra={
+                                              "error": detail.decode() if isinstance(detail, (bytes, bytearray)) else str(
+                                                  detail)})
+                        raise HTTPException(resp.status_code, detail.decode())
 
-                async for chunk in resp.aiter_bytes():
-                    # **non** modifichiamo né ricomponiamo: passthrough puro
-                    #print(chunk)
-                    yield chunk
-
+                    async for chunk in resp.aiter_bytes():
+                        # **non** modifichiamo né ricomponiamo: passthrough puro
+                        #print(chunk)
+                        # ⬇️ append preview risposta
+                        append_response_chunk(user_id=user_id, activity_id=activity_id, chunk=chunk)
+                        yield chunk
+        except Exception as e:
+            # ⬇️ garantisci tracciamento errore anche su eccezioni
+            finalize_activity(user_id=user_id, activity_id=activity_id, status="ERROR",
+                              extra={"error": str(e)})
+            raise
     # Il media_type è lo stesso dell’upstream (“application/json”)
-    return StreamingResponse(relay(), media_type="application/json")
+    return StreamingResponse(relay(), media_type="application/json")'''
 
 
 @app.get("/loaders_catalog", response_model=dict)
@@ -4652,6 +4875,11 @@ def validate_model_kwargs(body: ValidateKwargsIn):
 # NEW: storage su filesystem, un file per utente
 TASKS_DIR = Path(os.getenv("TASKS_DIR", "./user_tasks"))
 TASKS_DIR.mkdir(parents=True, exist_ok=True)
+_TASKS_ROOT = Path(os.getenv("TASKS_ROOT", "./user_tasks"))
+_TASKS_ROOT.mkdir(parents=True, exist_ok=True)
+
+def _tasks_file_for(user_id: str) -> Path:
+    return _TASKS_ROOT / f"{user_id}_upload_tasks.jsonl"
 
 # Per sincronizzare accessi concorrenti per utente (processo corrente)
 _user_task_locks: Dict[str, asyncio.Lock] = {}
@@ -4682,6 +4910,32 @@ def _load_user_tasks_sync(user_id: str) -> list[dict]:
     _ensure_user_file(user_id)
     data = json.loads(_tasks_file_path(user_id).read_text(encoding="utf-8"))
     return list(data.get("tasks") or [])
+
+'''def _read_task(user_id: str, upload_task_id: str) -> Optional[dict]:
+    """Legge il record dell'upload_task aggregato."""
+    path = _tasks_file_for(user_id)
+    if not path.exists():
+        return None
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            row = json.loads(line)
+        except Exception:
+            continue
+        if row.get("task_id") == upload_task_id:
+            return row
+    return None'''
+
+def _read_task(user_id: str, upload_task_id: str) -> Optional[dict]:
+    """
+    Legge il record dell'upload_task aggregato dallo stesso file JSON
+    usato da _append_task/_update_task/_load_user_tasks_sync.
+    """
+    tasks = _load_user_tasks_sync(user_id)
+    for t in tasks:
+        if t.get("task_id") == upload_task_id:
+            return t
+    return None
+
 
 def _save_user_tasks_sync(user_id: str, tasks: list[dict]) -> None:
     _ensure_user_file(user_id)
@@ -4784,3 +5038,100 @@ async def get_single_user_task(user_id: str, task_id: str):
         if t.get("task_id") == task_id:
             return t
     raise HTTPException(404, "Task non trovato")
+
+
+
+# === FILENAME NORMALIZE: request/response models ============================
+class NormalizeFilenameRequest(BaseModel):
+    filename: str = Field(..., description="Nome file originale da normalizzare")
+    token: Optional[str] = Field(
+        default=None,
+        description="Access token (richiesto solo se REQUIRED_AUTH=True)."
+    )
+
+class NormalizeFilenameResponse(BaseModel):
+    original_filename: str
+    normalized_filename: str
+    changed: bool = Field(
+        ...,
+        description="True se il nome normalizzato differisce dall'originale."
+    )
+# ============================================================================
+
+
+# === FILENAME NORMALIZE: endpoint POST ======================================
+@app.post("/filenames/normalize", response_model=NormalizeFilenameResponse)
+async def normalize_filename(body: NormalizeFilenameRequest):
+    """
+    Restituisce la versione normalizzata di `filename` usando la stessa
+    logica del backend (_sanitize_filename). Mantiene le estensioni
+    (anche multiple) e sostituisce accenti/spazi/caratteri non permessi.
+    """
+    if REQUIRED_AUTH:
+        verify_access_token(body.token, cognito_sdk)
+
+    normalized = _sanitize_filename(body.filename)
+    print(normalized)
+    return NormalizeFilenameResponse(
+        original_filename=body.filename,
+        normalized_filename=normalized,
+        changed=(normalized != body.filename),
+    )
+# ============================================================================
+
+@app.get("/activities", response_model=Dict[str, Any])
+async def get_activities(
+    username: str = Query(..., description="User id/username"),
+    token: Optional[str] = Query(None),
+    # filtri
+    start_date: Optional[str] = Query(None, description="ISO 8601"),
+    end_date: Optional[str] = Query(None, description="ISO 8601"),
+    type: Optional[str] = Query(None, description="UPLOAD_ASYNC | STREAM_EVENTS"),
+    status: Optional[str] = Query(None, description="PENDING | RUNNING | COMPLETED | ERROR"),
+    chain_id: Optional[str] = Query(None),
+    upload_task_id: Optional[str] = Query(None),
+    context: Optional[str] = Query(None),
+    file_id: Optional[str] = Query(None),
+    filename: Optional[str] = Query(None),
+    q: Optional[str] = Query(None, description="search text"),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(10, ge=1, le=100),
+):
+    if REQUIRED_AUTH:
+        verify_access_token(token, cognito_sdk)
+
+    filters = {
+        "start_date": start_date,
+        "end_date": end_date,
+        "type": type,
+        "status": status,
+        "chain_id": chain_id,
+        "upload_task_id": upload_task_id,
+        "context": context,
+        "file_id": file_id,
+        "filename": filename,
+        "q": q,
+    }
+    # rimuovi None
+    filters = {k: v for k, v in filters.items() if v is not None}
+
+    res = list_activities(user_id=username, filters=filters, skip=skip, limit=limit)
+    return res
+
+@app.get("/activities/{activity_id}", response_model=Dict[str, Any])
+async def get_activity_detail(
+    activity_id: str,
+    username: str = Query(..., description="User id/username"),
+    token: Optional[str] = Query(None)
+):
+    if REQUIRED_AUTH:
+        verify_access_token(token, cognito_sdk)
+
+    # lettura semplice del file
+    from pathlib import Path
+    path = Path(os.getenv("ACTIVITY_ROOT", "activity_logs")) / username / f"{activity_id}.json"
+    if not path.exists():
+        raise HTTPException(404, "Activity not found")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+

@@ -229,10 +229,13 @@ class ContextMetadata(BaseModel):
     custom_metadata: Optional[Dict[str, Any]] = None
 
 
+# CHANGED: aggiunto upload_task_id
 class FileUploadResponse(BaseModel):
     file_id: str
     contexts: List[str]
-    tasks: Optional[Any]=None
+    tasks: Optional[Any] = None   # mappa ctx → sotto-task (retrocompat)
+    upload_task_id: Optional[str] = None
+
 
 # --- aggiungi vicino agli altri BaseModel ---------------------------
 class GetChainConfigurationRequest(BaseModel):
@@ -321,6 +324,87 @@ async def _wait_task_done(
 
         await asyncio.sleep(poll_secs)
 
+# NEW: creazione del task aggregato
+async def _create_upload_task_record(
+    user_id: str,
+    file_uuid: str,
+    original_filename: str,
+    safe_filename: str,
+    task_map: Dict[str, Dict[str, str]],
+) -> str:
+    task_id = str(uuid.uuid4())
+    per_ctx: Dict[str, dict] = {}
+    for ctx, ids in task_map.items():
+        per_ctx[ctx] = PerContextStatus(
+            context=ctx,
+            loader_task_id=ids["loader_task_id"],
+            vector_task_id=ids["vector_task_id"],
+        ).model_dump()
+
+    task = UploadTask(
+        task_id=task_id,
+        user_id=user_id,
+        file_id=file_uuid,
+        original_filename=original_filename,
+        filename_safe=safe_filename,
+        contexts=list(task_map.keys()),
+        per_context=per_ctx,  # type: ignore
+        status="PENDING",
+        progress=0.0,
+        created_at=_now_iso(),
+        updated_at=_now_iso(),
+        read=False,
+    ).model_dump()
+
+    await _append_task(user_id, task)
+    return task_id
+
+
+def _recompute_overall_status(task_dict: dict) -> None:
+    pcs: dict = task_dict.get("per_context", {})
+    total = max(1, len(pcs))
+    completed = 0
+    any_error = False
+    for st in pcs.values():
+        if st.get("loader_status") == "ERROR" or st.get("vector_status") == "ERROR":
+            any_error = True
+        if st.get("loader_status") in ("DONE", "COMPLETED") and st.get("vector_status") in ("DONE", "COMPLETED"):
+            completed += 1
+
+    if any_error:
+        task_dict["status"] = "ERROR"
+    elif completed == total:
+        task_dict["status"] = "COMPLETED"
+    else:
+        task_dict["status"] = "RUNNING"
+
+    task_dict["progress"] = round(completed / total * 100.0, 1)
+
+
+async def _set_ctx_status(
+    user_id: str,
+    upload_task_id: str,
+    ctx: str,
+    *,
+    loader_status: Optional[str] = None,
+    vector_status: Optional[str] = None,
+    error: Optional[str] = None,
+) -> None:
+    def _mut(t: dict):
+        pcs: dict = t.get("per_context", {})
+        st: dict = pcs.get(ctx, {})
+        if loader_status is not None:
+            st["loader_status"] = loader_status
+        if vector_status is not None:
+            st["vector_status"] = vector_status
+        if error:
+            st["error"] = error
+            # se errore in un contesto, marchiamo lo stato globale su ERROR
+            t["error"] = error
+        pcs[ctx] = st
+        _recompute_overall_status(t)
+
+    await _update_task(user_id, upload_task_id, _mut)
 
 def _build_loader_config_payload(
     context: str,
@@ -439,7 +523,7 @@ async def _ensure_vector_store(
     return vector_store_config_id, vector_store_id
 
 
-async def _process_context_pipeline(
+'''async def _process_context_pipeline(
     ctx: str,
     file: UploadFile,
     file_content: bytes,
@@ -527,11 +611,11 @@ async def _process_context_pipeline(
     )
     print("#"*120)
     print(WAIT_2)
-    print("#" * 120)
+    print("#" * 120)'''
 
 
 # --------------------------- REWRITE *ENTIRE* helper ---------------------------
-async def upload_file_to_contexts_async(
+'''async def upload_file_to_contexts_async(
     file: UploadFile,
     contexts: List[str],
     file_metadata: Optional[Dict[str, Any]] = None,
@@ -580,8 +664,198 @@ async def upload_file_to_contexts_async(
 
     # la response torna SUBITO
     return {"file_id": file_uuid, "contexts": contexts, "tasks": task_map}
+'''
 
+# CHANGED: aggiunti user_id e upload_task_id, più update di stato
+async def _process_context_pipeline(
+    ctx: str,
+    file: UploadFile,
+    file_content: bytes,
+    file_uuid: str,
+    file_metadata: dict,
+    loader_task_id: str,
+    vector_task_id: str,
+    client: httpx.AsyncClient,
+    loaders: Optional[Dict[str, str]] = None,
+    loader_kwargs: Optional[Dict[str, Dict[str, Any]]] = None,
+    *,                          # NEW
+    user_id: str,               # NEW
+    upload_task_id: str,        # NEW
+):
+    """
+    Esegue TUTTE le operazioni “pesanti” per un singolo context:
+        0. upload raw file
+        1. config loader  + load_documents_async (attesa DONE)
+        2. config vector store (idempotente)      + add_docs_async
+    Tutte le chiamate sono già non-bloccanti vs l'utente; qui le orchestriamo.
+    """
+    try:
+        # ---------- 0. upload file --------------------------------------------------
+        data  = {
+            "subdir": ctx,
+            "extra_metadata": json.dumps({"file_uuid": file_uuid, **file_metadata})
+        }
 
+        file.filename = _safe_filename(file.filename)
+
+        files = {"file": (file.filename, file_content, file.content_type)}
+        await _post_or_400(client, f"{NLP_CORE_SERVICE}/data_stores/upload", data=data, files=files)
+
+        # ---------- 1. prepare loader ----------------------------------------------
+        # Calcolo deterministico del loader_id; collection name LEGACY (come prima)
+        loader_id, coll_name, loader_payload = _build_loader_config_payload(
+            ctx,
+            file,
+            collection_name=None,           # ignorato (legacy inside)
+            loader_config_id=None,          # ignorato (hash inside)
+            custom_loaders=loaders,
+            custom_kwargs=loader_kwargs,
+        )
+
+        print("#"*120)
+        print(file.filename)
+        print(loaders)
+        print(loader_kwargs)
+        print(json.dumps(loader_payload, indent=4))
+        print("#"*120)
+
+        await _post_or_400(
+            client,
+            f"{NLP_CORE_SERVICE}/document_loaders/configure_loader",
+            json=loader_payload
+        )
+
+        # NEW: segna LOADER come RUNNING
+        await _set_ctx_status(user_id, upload_task_id, ctx, loader_status="RUNNING")
+
+        # lancia il loader in async e aspetta che finisca
+        STEP_1 = await _post_or_400(
+            client,
+            f"{NLP_CORE_SERVICE}/document_loaders/load_documents_async/{loader_id}",
+            data={"task_id": loader_task_id},
+        )
+        print("#"*120)
+        print(STEP_1)
+        print("#" * 120)
+
+        WAIT_1 = await _wait_task_done(client, f"{NLP_CORE_SERVICE}/document_loaders/task_status/{loader_task_id}")
+
+        print("#"*120)
+        print(WAIT_1)
+        print("#" * 120)
+
+        # NEW: aggiorna stato LOADER al termine
+        await _set_ctx_status(user_id, upload_task_id, ctx, loader_status=WAIT_1.get("status", "DONE"))
+        if WAIT_1.get("status") == "ERROR":
+            await _set_ctx_status(user_id, upload_task_id, ctx, error=str(WAIT_1.get("error") or "Loader failed"))
+            return  # stop su errore
+
+        # ---------- 2. config / load vector store ----------------------------------
+        _, vect_id = await _ensure_vector_store(ctx, client)  # idempotente
+
+        # NEW: segna VECTOR come RUNNING
+        await _set_ctx_status(user_id, upload_task_id, ctx, vector_status="RUNNING")
+
+        STEP_2 = await _post_or_400(
+            client,
+            f"{NLP_CORE_SERVICE}/vector_stores/vector_store/add_documents_from_store_async/{vect_id}",
+            params={"document_collection": coll_name, "task_id": vector_task_id},
+        )
+        print("#"*120)
+        print(STEP_2)
+        print("#" * 120)
+
+        WAIT_2 = await _wait_task_done(
+            client,
+            f"{NLP_CORE_SERVICE}/vector_stores/vector_store/task_status/{vector_task_id}"
+        )
+        print("#"*120)
+        print(WAIT_2)
+        print("#" * 120)
+
+        # NEW: aggiorna stato VECTOR al termine
+        await _set_ctx_status(user_id, upload_task_id, ctx, vector_status=WAIT_2.get("status", "DONE"))
+        if WAIT_2.get("status") == "ERROR":
+            await _set_ctx_status(user_id, upload_task_id, ctx, error=str(WAIT_2.get("error") or "Vector failed"))
+            return
+
+        # se arrivo qui il contesto è completato; _recompute_overall_status() farà il resto
+    except Exception as e:
+        # qualsiasi eccezione → marca errore nel contesto
+        try:
+            await _set_ctx_status(user_id, upload_task_id, ctx, error=str(e))
+        except Exception:
+            pass
+
+# CHANGED: aggiunto user_id; crea task aggregato e lo passa ai worker; ritorna upload_task_id
+async def upload_file_to_contexts_async(
+    file: UploadFile,
+    contexts: List[str],
+    file_metadata: Optional[Dict[str, Any]] = None,
+    *,                       # ← chiamato dall’endpoint /upload
+    background_tasks: BackgroundTasks,
+    loaders: Optional[Dict[str, str]] = None,
+    loader_kwargs: Optional[Dict[str, Dict[str, Any]]] = None,
+    user_id: Optional[str] = None,              # NEW
+):
+    """
+    Orchestratore: prepara i task-id, accoda le pipeline in BackgroundTasks
+    e restituisce subito la mappa <context → {loader_task_id, vector_task_id}>.
+    Ora, in più, crea un SINGOLO UploadTask aggregato legato all'utente.
+    """
+    timeout       = httpx.Timeout(600.0, connect=600.0, read=600.0, write=600.0)
+    file_uuid     = str(uuid.uuid4())
+    file_content  = await file.read()
+    contexts      = contexts[0].split(",")
+    task_map: Dict[str, Dict[str, str]] = {}
+
+    # Creiamo UN client condiviso per tutti i task (performance)
+    client = httpx.AsyncClient(timeout=timeout)
+
+    # genera tutti i sotto-task (per context)
+    for ctx in contexts:
+        loader_task_id = str(uuid.uuid4())
+        vector_task_id = str(uuid.uuid4())
+        task_map[ctx]  = {
+            "loader_task_id": loader_task_id,
+            "vector_task_id": vector_task_id,
+        }
+
+    # NEW: crea il record del task aggregato file-based per l'utente
+    safe_name = _safe_filename(file.filename)
+    upload_task_id = await _create_upload_task_record(
+        user_id=(user_id or "unknown"),
+        file_uuid=file_uuid,
+        original_filename=file.filename,
+        safe_filename=safe_name,
+        task_map=task_map,
+    )
+
+    # Accoda i worker in background, passando anche user_id e upload_task_id
+    for ctx, ids in task_map.items():
+        background_tasks.add_task(
+            _process_context_pipeline,
+            ctx,
+            file,
+            file_content,
+            file_uuid,
+            file_metadata or {},
+            ids["loader_task_id"],
+            ids["vector_task_id"],
+            client,
+            loaders,
+            loader_kwargs,                 # passiamo il client già creato
+            user_id=(user_id or "unknown"),# NEW
+            upload_task_id=upload_task_id, # NEW
+        )
+
+    # la response torna SUBITO (retrocompat + nuovo upload_task_id)
+    return {
+        "file_id": file_uuid,
+        "contexts": contexts,
+        "tasks": task_map,
+        "upload_task_id": upload_task_id,   # NEW
+    }
 
 
 # Funzione per selezionare una chiave API casuale
@@ -611,6 +885,7 @@ def verify_access_token(token: str | None, sdk_instance) -> None:
 # Helper function to communicate with the existing API
 async def create_context_on_server(context_path: str, metadata: Optional[Dict[str, Any]] = None):
     async with httpx.AsyncClient() as client:
+
         response = await client.post(
             f"{NLP_CORE_SERVICE}/data_stores/create_directory",
             data={
@@ -1268,14 +1543,16 @@ async def upload_file_to_multiple_contexts_async(
         subscription_id=subscription_id
     )
 
-    return await upload_file_to_contexts_async(
+    result = await upload_file_to_contexts_async(
         file,
         contexts,
         file_meta,
         background_tasks=background_tasks,
         loaders=loaders_dict,
         loader_kwargs=kwargs_dict,
+        user_id=username,  # NEW: associa all’utente
     )
+    return result
 
 
 # Helper function to list files by context
@@ -4361,3 +4638,193 @@ def validate_model_kwargs(body: ValidateKwargsIn):
         normalized[k] = v
 
     return ValidateKwargsOut(ok=(len(errors) == 0), errors=errors, normalized=normalized, schema=schema)
+
+
+
+
+
+
+
+
+# =========================
+# NOTIFICHE / UPLOAD TASKS
+# =========================
+# NEW: storage su filesystem, un file per utente
+TASKS_DIR = Path(os.getenv("TASKS_DIR", "./user_tasks"))
+TASKS_DIR.mkdir(parents=True, exist_ok=True)
+
+# Per sincronizzare accessi concorrenti per utente (processo corrente)
+_user_task_locks: Dict[str, asyncio.Lock] = {}
+
+def _now_iso() -> str:
+    return datetime.utcnow().isoformat()
+
+def _tasks_file_path(user_id: str) -> Path:
+    safe = _sanitize_filename(user_id or "unknown")
+    return TASKS_DIR / f"{safe}.json"
+
+def _get_user_lock(user_id: str) -> asyncio.Lock:
+    if user_id not in _user_task_locks:
+        _user_task_locks[user_id] = asyncio.Lock()
+    return _user_task_locks[user_id]
+
+def _ensure_user_file(user_id: str) -> None:
+    fp = _tasks_file_path(user_id)
+    if not fp.exists():
+        fp.write_text(json.dumps({"tasks": []}, ensure_ascii=False, indent=2), encoding="utf-8")
+
+def _atomic_write_json(path: Path, payload: dict) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
+
+def _load_user_tasks_sync(user_id: str) -> list[dict]:
+    _ensure_user_file(user_id)
+    data = json.loads(_tasks_file_path(user_id).read_text(encoding="utf-8"))
+    return list(data.get("tasks") or [])
+
+def _save_user_tasks_sync(user_id: str, tasks: list[dict]) -> None:
+    _ensure_user_file(user_id)
+    _atomic_write_json(_tasks_file_path(user_id), {"tasks": tasks})
+
+async def _append_task(user_id: str, task: dict) -> None:
+    lock = _get_user_lock(user_id)
+    async with lock:
+        tasks = _load_user_tasks_sync(user_id)
+        tasks.append(task)
+        _save_user_tasks_sync(user_id, tasks)
+
+async def _update_task(user_id: str, task_id: str, mutator) -> None:
+    """
+    mutator: funzione che riceve il dict del task e lo modifica in-place.
+    - setta updated_at e read=False ad ogni cambiamento
+    """
+    lock = _get_user_lock(user_id)
+    async with lock:
+        tasks = _load_user_tasks_sync(user_id)
+        for t in tasks:
+            if t.get("task_id") == task_id:
+                mutator(t)
+                t["updated_at"] = _now_iso()
+                t["read"] = False  # ogni cambio → torna non letto
+                _save_user_tasks_sync(user_id, tasks)
+                return
+        # se non trovato, non crashiamo (può capitare in race condizioni)
+
+
+# NEW: modelli task
+class PerContextStatus(BaseModel):
+    context: str
+    loader_task_id: str
+    vector_task_id: str
+    loader_status: str = "PENDING"
+    vector_status: str = "PENDING"
+    error: Optional[str] = None
+
+class UploadTask(BaseModel):
+    task_id: str
+    kind: Literal["upload"] = "upload"
+    user_id: str
+    file_id: str
+    original_filename: str
+    filename_safe: str
+    contexts: List[str]
+    per_context: Dict[str, PerContextStatus]
+    status: Literal["PENDING","RUNNING","ERROR","COMPLETED"] = "PENDING"
+    progress: float = 0.0
+    created_at: str
+    updated_at: str
+    read: bool = False
+    error: Optional[str] = None
+
+
+# =========================
+# ENDPOINTS TASKS PER UTENTE
+# =========================
+
+class UserTasksResponse(BaseModel):
+    tasks: List[Dict[str, Any]]
+
+@app.get("/user_tasks/{user_id}", response_model=UserTasksResponse)
+async def get_user_tasks(
+    user_id: str,
+    unread_only: bool = Query(False, description="Se true, restituisce solo i task non letti"),
+):
+    # NB: non modifica il flag 'read'
+    tasks = _load_user_tasks_sync(user_id)
+    if unread_only:
+        tasks = [t for t in tasks if not bool(t.get("read"))]
+    return {"tasks": tasks}
+
+@app.get("/user_tasks/{user_id}/unread", response_model=UserTasksResponse)
+async def get_user_unread_tasks_and_mark_read(user_id: str):
+    """
+    Restituisce TUTTI i task con read=False e li marca immediatamente a read=True.
+    Così non verranno restituiti alla chiamata successiva.
+    """
+    lock = _get_user_lock(user_id)
+    async with lock:
+        tasks = _load_user_tasks_sync(user_id)
+        unread = [t for t in tasks if not bool(t.get("read"))]
+        if unread:
+            # marca come letti SOLO quelli restituiti
+            unread_ids = {t["task_id"] for t in unread}
+            for t in tasks:
+                if t.get("task_id") in unread_ids:
+                    t["read"] = True
+                    t["updated_at"] = _now_iso()
+            _save_user_tasks_sync(user_id, tasks)
+        return {"tasks": unread}
+
+
+@app.get("/user_tasks/{user_id}/{task_id}", response_model=Dict[str, Any])
+async def get_single_user_task(user_id: str, task_id: str):
+    tasks = _load_user_tasks_sync(user_id)
+    for t in tasks:
+        if t.get("task_id") == task_id:
+            return t
+    raise HTTPException(404, "Task non trovato")
+
+
+
+# === FILENAME NORMALIZE: request/response models ============================
+class NormalizeFilenameRequest(BaseModel):
+    filename: str = Field(..., description="Nome file originale da normalizzare")
+    token: Optional[str] = Field(
+        default=None,
+        description="Access token (richiesto solo se REQUIRED_AUTH=True)."
+    )
+
+class NormalizeFilenameResponse(BaseModel):
+    original_filename: str
+    normalized_filename: str
+    changed: bool = Field(
+        ...,
+        description="True se il nome normalizzato differisce dall'originale."
+    )
+# ============================================================================
+
+
+# === FILENAME NORMALIZE: endpoint POST ======================================
+@app.post("/filenames/normalize", response_model=NormalizeFilenameResponse)
+async def normalize_filename(body: NormalizeFilenameRequest):
+    """
+    Restituisce la versione normalizzata di `filename` usando la stessa
+    logica del backend (_sanitize_filename). Mantiene le estensioni
+    (anche multiple) e sostituisce accenti/spazi/caratteri non permessi.
+    """
+    if REQUIRED_AUTH:
+        verify_access_token(body.token, cognito_sdk)
+
+    normalized = _sanitize_filename(body.filename)
+    print(normalized)
+    return NormalizeFilenameResponse(
+        original_filename=body.filename,
+        normalized_filename=normalized,
+        changed=(normalized != body.filename),
+    )
+# ============================================================================
+
+
+
+
