@@ -3093,14 +3093,14 @@ async def loader_kwargs_schema():
             "combine_under_n_chars": {
                 "name": "combine_under_n_chars",
                 "type": "integer",
-                "default": 2000,
+                "default": 15000,
                 "items": None,
                 "example": 2000
             },
             "max_characters": {
                 "name": "max_characters",
                 "type": "integer",
-                "default": 4000,
+                "default": 15000,
                 "items": None,
                 "example": 4000
             },
@@ -3114,14 +3114,14 @@ async def loader_kwargs_schema():
             "new_after_n_chars": {
                 "name": "new_after_n_chars",
                 "type": "integer",
-                "default": None,
+                "default": 15000,
                 "items": None,
                 "example": 1500
             },
             "overlap": {
                 "name": "overlap",
                 "type": "integer",
-                "default": 200,
+                "default": 0,
                 "items": None,
                 "example": 200
             },
@@ -3137,7 +3137,7 @@ async def loader_kwargs_schema():
             "request_timeout_seconds": {
                 "name": "request_timeout_seconds",
                 "type": "integer",
-                "default": 180,
+                "default": 300,
                 "items": None,
                 "example": 300
             },
