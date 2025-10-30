@@ -261,7 +261,7 @@ class GetChainConfigurationRequest(BaseModel):
 # NUOVO: descrive la configurazione di un LLM ChatOpenAI
 # ------------------------------------------------------------------
 class LLMConfig(BaseModel):
-    model_name: str = "gpt-4.1"          # default
+    model_name: str = "gpt-4o"          # default
     temperature: float = 0.25
     max_tokens: int = 16000
     max_retries: int = 2
@@ -1911,7 +1911,7 @@ async def configure_and_load_chain_(
 class ConfigureAndLoadChainInput(BaseModel):
     contexts: List[str] = []  # Lista di contesti (vuota di default)
     llm: Optional[LLMConfig] = None
-    model_name: Optional[str] = "gpt-4.1"  # Nome del modello, default "gpt-4.1"
+    model_name: Optional[str] = "gpt-4o"  # Nome del modello, default "gpt-4o-mini"
     system_message: Optional[str] = "You are an helpful assistant."
     system_message_content: Optional[str] = Field(
         default = None,
@@ -3712,7 +3712,7 @@ async def estimate_chain_interaction_cost(
     llm_cfg        = await _get_llm_config(llm_id)
     model_name     = (
         llm_cfg.get("model_kwargs", {}).get("model_name")
-        if llm_cfg else "gpt-4.1"
+        if llm_cfg else "gpt-4o"
     )
     max_out_tokens = (
         llm_cfg.get("model_kwargs", {}).get("max_tokens", MAX_OUTPUT_TOKENS_DEF)
