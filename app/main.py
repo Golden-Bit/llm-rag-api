@@ -84,6 +84,17 @@ openai_api_keys = config["openai_api_keys"]
 # --- HELPER: filename sanitizzato (accenti → non accentati; consentiti: A-Za-z0-9 , _ - .) ---
 
 
+def _is_gpt5(name: str | None) -> bool:
+    """
+    True se il modello appartiene alla famiglia gpt-5* (case-insensitive).
+    Esempi validi: gpt-5, gpt-5-mini, gpt-5-chat-latest, gpt-5-codex.
+    """
+    if not name:
+        return False
+    m = name.strip().lower()
+    return m.startswith("gpt-5")
+
+
 _ALLOWED_CHARS_RE = re.compile(r"[^A-Za-z0-9_-]")
 
 def _strip_accents(s: str) -> str:
@@ -267,6 +278,12 @@ class LLMConfig(BaseModel):
     max_retries: int = 2
     api_key: Optional[str] = None       # se None → lo riempiamo runtime
 
+    @model_validator(mode="after")
+    def _enforce_gpt5_temperature(self):
+        if _is_gpt5(self.model_name):
+            # GPT-5 supporta solo temperature = 1.0
+            self.temperature = 1.0
+        return self
 
 def make_llm_ids(cfg: LLMConfig) -> tuple[str, str]:
     """
@@ -2001,8 +2018,13 @@ async def configure_and_load_chain(
     # ● STEP 1 – costruiamo la cfg LLM (default + override da utente)
     # ------------------------------------------------------------------
     model_name = input_data.model_name
-    llm_cfg = input_data.llm or LLMConfig()  # default se None
-    if model_name: llm_cfg.model_name = model_name
+    base_llm_cfg = input_data.llm or LLMConfig()  # default se None
+
+    # ✅ Re-instanzia LLMConfig per applicare SEMPRE i validator dopo l’override del model_name
+    if model_name:
+        llm_cfg = LLMConfig(**{**base_llm_cfg.model_dump(), "model_name": model_name})
+    else:
+        llm_cfg = LLMConfig(**base_llm_cfg.model_dump())
 
     if llm_cfg.api_key is None:  # riempi API-key on-the-fly
         llm_cfg.api_key = get_random_openai_api_key()
