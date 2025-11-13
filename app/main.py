@@ -98,46 +98,78 @@ def _is_gpt5(name: str | None) -> bool:
 _ALLOWED_CHARS_RE = re.compile(r"[^A-Za-z0-9_-]")
 
 def _strip_accents(s: str) -> str:
-    # rimuove i segni diacritici (es. "è" -> "e", "à" -> "a")
-    return "".join(ch for ch in unicodedata.normalize("NFKD", s) if not unicodedata.combining(ch))
+    return "".join(
+        ch
+        for ch in unicodedata.normalize("NFKD", s)
+        if not unicodedata.combining(ch)
+    )
+
+def _split_stem_suffix(name: str) -> tuple[str, str]:
+    """
+    Divide il nome in:
+    - stem: parte 'logica' del nome file (dove i punti NON sono estensioni)
+    - suffix: estensione 'vera', eventualmente multipla (.tar.gz, .tar.bz2, ...)
+    """
+    p = Path(name)
+    base = p.name              # solo il nome, senza path
+    suffixes = p.suffixes      # lista di tutti i .qualcosa trovati
+
+    # Estensioni multiple note (puoi allungare questa lista)
+    MULTI_EXT_HEADS = {".tar"}   # es: .tar.gz, .tar.bz2, .tar.xz, ecc.
+
+    if len(suffixes) >= 2 and suffixes[-2].lower() in MULTI_EXT_HEADS:
+        # Esempio: "backup.v1.tar.gz"
+        # suffixes = [".v1", ".tar", ".gz"]
+        # prendiamo solo ".tar.gz" come vera estensione
+        suffix = suffixes[-2] + suffixes[-1]     # ".tar.gz"
+    elif suffixes:
+        # Caso normale: una sola estensione vera
+        suffix = suffixes[-1]                    # es. ".pdf"
+    else:
+        suffix = ""
+
+    stem = base[:-len(suffix)] if suffix else base
+    return stem, suffix
 
 def _sanitize_filename(name: str) -> str:
-    """
-    - Sostituisce lettere accentate con equivalenti non accentate
-    - Elimina tutto ciò che NON è in [A-Za-z0-9,._-]
-    - Mantiene le estensioni (anche multiple, es. .tar.gz)
-    - Evita nomi vuoti: fallback a 'file'
-    """
     if not isinstance(name, str):
         name = str(name)
 
-    # separa stem ed eventuali estensioni (anche multiple)
-    p = Path(name)
-    suffix = "".join(p.suffixes)  # es. ".tar.gz"
-    stem   = p.name[:-len(suffix)] if suffix else p.name
+    # --- NUOVO: usare lo split "intelligente" tra stem e suffix ---
+    stem, suffix = _split_stem_suffix(name)
 
+    # Normalizza spazi e underscore
     stem = stem.replace(" ", "_").replace("\t", "_")
     stem = re.sub(r"\s+", "_", stem)
     stem = re.sub(r"_+", "_", stem)
 
-    # normalizza accenti su stem ed estensione
-    stem   = _strip_accents(stem)
-    #suffix = _strip_accents(suffix)
+    # Rimuove accenti
+    stem = _strip_accents(stem)
 
-    # rimuovi caratteri non consentiti
-    stem   = _ALLOWED_CHARS_RE.sub("", stem)
-    # per l'estensione ammettiamo solo lettere/numeri e punti
-    #suffix = re.sub(r"[^A-Za-z0-9.]", "", suffix)
+    # *** Qui rimuoviamo esplicitamente eventuali punti rimasti nello stem ***
+    # (sono sicuramente "interni" al nome, quindi NON estensioni)
+    stem = stem.replace(".", "")   # oppure stem = stem.replace(".", "_") se li vuoi come underscore
 
-    # pulizia bordi (evita nomi tipo "._-,")
-    #stem = stem.strip(".,_-")
+    # Applica la regex di sicurezza (toglie ciò che non è [A-Za-z0-9_-])
+    stem = _ALLOWED_CHARS_RE.sub("", stem)
+
+    # (Opzionale) pulizia bordi: evita nomi tipo "._-,"
+    stem = stem.strip(".,_-")
+
+    # --- Sanifica anche il suffix ---
+    suffix = _strip_accents(suffix)
+    # tiene solo lettere, numeri e punti
+    suffix = re.sub(r"[^A-Za-z0-9.]", "", suffix)
+
+    # Se per qualche motivo abbiamo perso il punto iniziale, lo riaggiungiamo
+    if suffix and not suffix.startswith("."):
+        suffix = "." + suffix
 
     if not stem:
         stem = "file"
 
     return f"{stem}{suffix}"
 
-# retro-compat: manteniamo i nomi delle vecchie funzioni ma facciamole puntare al nuovo sanitizzatore
 def _safe_filename(name: str) -> str:
     return _sanitize_filename(name)
 
