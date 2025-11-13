@@ -467,6 +467,6 @@ default_instructions = [
     #show_chat_vars_widget_instructions,
     nbutton_widget_instruction,
     change_chat_name_instructions,
-    #auto_sequence_widget_instructions,
-    #js_runner_instructions,
+    auto_sequence_widget_instructions,
+    js_runner_instructions,
 ]
