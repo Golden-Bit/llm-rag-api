@@ -2210,22 +2210,19 @@ async def configure_and_load_chain(
 
     # vectorstore_ids = [vector_store_id]
 
-    default_tools = [{"name": "VectorStoreTools", "kwargs": {"store_id": vectorstore_id}} for vectorstore_id in vectorstore_ids]
+    default_tools = [{"name": "VectorStoreTools", "kwargs": {"store_id": vs_id}}
+                     for vs_id in vectorstore_ids]
 
-    #default_tools.append({"name": "MongoDBTools",
-    #              "kwargs": {
-    #                  "connection_string": "mongodb://localhost:27017",
-    #                  "default_database": f"default_db",
-    #                  "default_collection": "default_collection"
-    #              }})
+    # Solo per gli altri tool voglio deduplica per nome
+    tools = default_tools[:]  # copia di base
 
-    # ── Applico le custom_tools: sovrascrivo o aggiungo ────────────────────
-    tools_by_name = {t["name"]: t for t in default_tools}
-
-    for ct in input_data.custom_server_tools:
-        tools_by_name[ct["name"]] = ct
-    tools = list(tools_by_name.values())
-
+    if input_data.custom_server_tools:
+        # costruiamo un dict solo per i custom, opzionalmente deduplicando per name
+        custom_by_name = {}
+        for ct in input_data.custom_server_tools:
+            custom_by_name[ct["name"]] = ct
+        # aggiungiamo i custom alla lista (non tocchiamo i VectorStoreTools di default)
+        tools.extend(custom_by_name.values())
 
     _NOOP_TOOL = {"name": "NoopTool", "kwargs": {}}
 
@@ -2712,6 +2709,7 @@ async def stream_events_chain(
 
                     async for chunk in resp.aiter_bytes():
                         append_response_chunk(user_id=user_id, activity_id=activity_id, chunk=chunk)
+                        print(chunk)
                         yield chunk
 
         except Exception as e:
