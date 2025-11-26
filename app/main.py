@@ -2996,9 +2996,9 @@ async def loader_kwargs_schema():
             "url": {
                 "name": "url",
                 "type": "string",
-                "default": "http://34.13.153.241:8333/",
+                "default": "http://34.77.241.172:8333/",
                 "items": None,
-                "example": "http://34.13.153.241:8333/",
+                "example": "http://34.77.241.172:8333/",
                 "editable": True
             },
             "api_key": {
