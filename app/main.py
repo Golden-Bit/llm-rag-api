@@ -5228,3 +5228,25 @@ async def payments_get_whitelist(_: bool = Security(require_llmrag_whitelist_adm
 
     return resp.json()
 
+
+@app.post("/payments/whitelist", response_model=Dict[str, Any])
+async def payments_patch_whitelist(body: WhitelistPatchIn, _: bool = Security(require_llmrag_whitelist_admin_key)):
+    url = f"{PLANS_API_BASE}/me/plans/whitelist"
+    headers = {"X-API-Key": (PLANS_ADMIN_API_KEY or "").strip()}
+
+    payload = {"replace": body.replace, "add": body.add, "remove": body.remove}
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(url, headers=headers, json=payload)
+    except httpx.RequestError as e:
+        raise HTTPException(502, f"Errore connessione verso Payments API: {str(e)}")
+
+    if resp.status_code >= 400:
+        try:
+            raise HTTPException(resp.status_code, resp.json())
+        except Exception:
+            raise HTTPException(resp.status_code, resp.text)
+
+    return resp.json()
+
