@@ -4,7 +4,7 @@ import asyncio
 import base64
 import copy
 from collections.abc import Mapping
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Query, Body, BackgroundTasks, Depends, Path
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Query, Body, BackgroundTasks, Depends, Path, Security
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
 import uuid
@@ -54,12 +54,29 @@ from app.utils.payments_utils import (_mk_plans_client, _find_current_subscripti
                                       _dataclass_to_dict,
                                       build_variants_for_intent, ChangeIntent, features_for_update, _sorted_variants,
                                       _variant_value, _cfg_key, _config_cache_get, _config_cache_put, _price_cache_put,
-                                      _price_cache_get, _consume_credits_or_402, PLANS_DEFAULT_PLAN_TYPE)
+                                      _price_cache_get, _consume_credits_or_402, PLANS_DEFAULT_PLAN_TYPE, PLANS_API_BASE,
+                                      PLANS_API_BASE, PLANS_ADMIN_API_KEY)
+
+from fastapi.security import APIKeyHeader
+
 app = FastAPI(
     root_path="/llm-rag"
 )
 
 REQUIRED_AUTH = False
+
+WHITELIST_ADMIN_KEY = os.getenv("LLM_RAG_WHITELIST_ADMIN_KEY", "").strip()
+
+_llm_admin_key_scheme = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+def require_llmrag_whitelist_admin_key(x_api_key: str | None = Security(_llm_admin_key_scheme)) -> bool:
+    expected = WHITELIST_ADMIN_KEY or (PLANS_ADMIN_API_KEY or "").strip()
+    if not expected:
+        raise HTTPException(500, "Admin key non configurata (LLM_RAG_WHITELIST_ADMIN_KEY o PLANS_ADMIN_API_KEY).")
+    if not x_api_key or x_api_key.strip() != expected:
+        raise HTTPException(403, "Forbidden (missing/invalid admin key)")
+    return True
+
 
 # Crea un'istanza dell'SDK (configura l'URL base secondo le tue necessità)
 cognito_sdk = CognitoSDK(base_url="https://teatek-llm.theia-innovation.com/auth")
@@ -5186,4 +5203,28 @@ async def get_activity_detail(
         raise HTTPException(404, "Activity not found")
     return json.loads(path.read_text(encoding="utf-8"))
 
+
+class WhitelistPatchIn(BaseModel):
+    replace: Optional[List[str]] = None
+    add: List[str] = Field(default_factory=list)
+    remove: List[str] = Field(default_factory=list)
+
+@app.get("/payments/whitelist", response_model=Dict[str, Any])
+async def payments_get_whitelist(_: bool = Security(require_llmrag_whitelist_admin_key)):
+    url = f"{PLANS_API_BASE}/me/plans/whitelist"
+    headers = {"X-API-Key": (PLANS_ADMIN_API_KEY or "").strip()}
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(url, headers=headers)
+    except httpx.RequestError as e:
+        raise HTTPException(502, f"Errore connessione verso Payments API: {str(e)}")
+
+    if resp.status_code >= 400:
+        try:
+            raise HTTPException(resp.status_code, resp.json())
+        except Exception:
+            raise HTTPException(resp.status_code, resp.text)
+
+    return resp.json()
 
